@@ -1,0 +1,26 @@
+version: '3.8'
+services:
+  bot:
+    build:
+      context: .
+      target: dev
+    container_name: julia-bot
+    env_file:
+      - .env
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./:/app
+      - /app/node_modules
+      - ./data:/app/data
+      - ./assets:/app/assets
+    command: npm run dev
+    restart: unless-stopped
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    extra_hosts:
+      - "api.telegram.org:149.154.167.220"
+
+
+
