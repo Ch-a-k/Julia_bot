@@ -25,6 +25,15 @@ export type Payment = {
   paidAt?: number | null;
 };
 
+export type UserInfo = {
+  telegramUserId: number;
+  username?: string | null;
+  firstName?: string | null;
+  lastName?: string | null;
+  phone?: string | null;
+  updatedAt: number;
+};
+
 let db: Database.Database;
 
 export function initDb(): void {
@@ -65,6 +74,15 @@ export function initDb(): void {
     CREATE TABLE IF NOT EXISTS settings (
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS users (
+      telegramUserId INTEGER PRIMARY KEY,
+      username TEXT,
+      firstName TEXT,
+      lastName TEXT,
+      phone TEXT,
+      updatedAt INTEGER NOT NULL
     );
   `);
 }
@@ -196,5 +214,299 @@ export function markPaymentStatus(invoiceId: string, status: string, paidAt?: nu
   });
 }
 
+// Получить все активные подписки (для рассылки)
+export function getAllActiveSubscriptions(): Subscription[] {
+  const nowSec = Math.floor(Date.now() / 1000);
+  const rows = getDb().prepare(
+    `SELECT * FROM subscriptions WHERE active=1 AND endAt > ?`
+  ).all(nowSec) as Subscription[];
+  return rows;
+}
 
+// Создать подписку на N дней (для тестов)
+export function createSubscriptionForDays(
+  telegramUserId: number,
+  chatId: string,
+  days: number
+): Subscription {
+  const dbConn = getDb();
+  const nowSec = Math.floor(Date.now() / 1000);
+  
+  // Деактивируем старые подписки этого пользователя
+  dbConn.prepare(
+    `UPDATE subscriptions SET active=0 WHERE telegramUserId=? AND chatId=?`
+  ).run(telegramUserId, chatId);
+  
+  const secondsToAdd = days * 24 * 60 * 60;
+  const startAt = nowSec;
+  const endAt = nowSec + secondsToAdd;
+  const planCode = 'TEST' as PlanCode;
 
+  const info = dbConn.prepare(
+    `INSERT INTO subscriptions (telegramUserId, chatId, planCode, startAt, endAt, active)
+     VALUES (@telegramUserId, @chatId, @planCode, @startAt, @endAt, 1)`
+  ).run({ telegramUserId, chatId, planCode, startAt, endAt });
+
+  const inserted = dbConn.prepare(
+    `SELECT * FROM subscriptions WHERE id=?`
+  ).get(info.lastInsertRowid) as Subscription;
+  return inserted;
+}
+
+// Получить подписку пользователя (для отображения даты окончания)
+export function getUserSubscription(telegramUserId: number, chatId: string): Subscription | null {
+  const row = getDb().prepare(
+    `SELECT * FROM subscriptions WHERE telegramUserId=? AND chatId=? AND active=1 ORDER BY endAt DESC LIMIT 1`
+  ).get(telegramUserId, chatId) as Subscription | undefined;
+  return row ?? null;
+}
+
+// Отозвать подписку пользователя
+export function revokeUserSubscription(telegramUserId: number, chatId: string): boolean {
+  const result = getDb().prepare(
+    `UPDATE subscriptions SET active=0 WHERE telegramUserId=? AND chatId=? AND active=1`
+  ).run(telegramUserId, chatId);
+  return result.changes > 0;
+}
+
+// Сохранить/обновить информацию о пользователе
+export function saveUserInfo(user: {
+  telegramUserId: number;
+  username?: string | null;
+  firstName?: string | null;
+  lastName?: string | null;
+  phone?: string | null;
+}): void {
+  const nowSec = Math.floor(Date.now() / 1000);
+  getDb().prepare(`
+    INSERT INTO users (telegramUserId, username, firstName, lastName, phone, updatedAt)
+    VALUES (@telegramUserId, @username, @firstName, @lastName, @phone, @updatedAt)
+    ON CONFLICT(telegramUserId) DO UPDATE SET
+      username = COALESCE(@username, username),
+      firstName = COALESCE(@firstName, firstName),
+      lastName = COALESCE(@lastName, lastName),
+      phone = COALESCE(@phone, phone),
+      updatedAt = @updatedAt
+  `).run({
+    telegramUserId: user.telegramUserId,
+    username: user.username ?? null,
+    firstName: user.firstName ?? null,
+    lastName: user.lastName ?? null,
+    phone: user.phone ?? null,
+    updatedAt: nowSec,
+  });
+}
+
+// Получить информацию о пользователе
+export function getUserInfo(telegramUserId: number): UserInfo | null {
+  const row = getDb().prepare(
+    `SELECT * FROM users WHERE telegramUserId = ?`
+  ).get(telegramUserId) as UserInfo | undefined;
+  return row ?? null;
+}
+
+// Расширенная информация о подписках с данными пользователей и платежей
+export type ExtendedSubscriptionInfo = {
+  id: number;
+  telegramUserId: number;
+  planCode: PlanCode;
+  startAt: number;
+  endAt: number;
+  // User info
+  username?: string | null;
+  firstName?: string | null;
+  lastName?: string | null;
+  phone?: string | null;
+  // Payment info
+  paidAt?: number | null;
+  amount?: number | null;
+};
+
+export function getExtendedActiveSubscriptions(): ExtendedSubscriptionInfo[] {
+  const nowSec = Math.floor(Date.now() / 1000);
+  const rows = getDb().prepare(`
+    SELECT 
+      s.id,
+      s.telegramUserId,
+      s.planCode,
+      s.startAt,
+      s.endAt,
+      u.username,
+      u.firstName,
+      u.lastName,
+      u.phone,
+      p.paidAt,
+      p.amount
+    FROM subscriptions s
+    LEFT JOIN users u ON s.telegramUserId = u.telegramUserId
+    LEFT JOIN (
+      SELECT telegramUserId, paidAt, amount, planCode,
+             ROW_NUMBER() OVER (PARTITION BY telegramUserId ORDER BY paidAt DESC) as rn
+      FROM payments WHERE status = 'success'
+    ) p ON s.telegramUserId = p.telegramUserId AND p.rn = 1
+    WHERE s.active = 1 AND s.endAt > ?
+    ORDER BY s.endAt ASC
+  `).all(nowSec) as ExtendedSubscriptionInfo[];
+  return rows;
+}
+
+// Поиск пользователей по ID, username или части имени
+export function findUsersByQuery(query: string): number[] {
+  const q = query.trim().toLowerCase();
+  
+  // Если это число - ищем по ID
+  if (/^\d+$/.test(q)) {
+    return [parseInt(q, 10)];
+  }
+  
+  // Ищем по username или имени
+  const rows = getDb().prepare(`
+    SELECT DISTINCT telegramUserId FROM users
+    WHERE LOWER(username) LIKE ? 
+       OR LOWER(firstName) LIKE ? 
+       OR LOWER(lastName) LIKE ?
+       OR CAST(telegramUserId AS TEXT) LIKE ?
+  `).all(`%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`) as { telegramUserId: number }[];
+  
+  return rows.map(r => r.telegramUserId);
+}
+
+// Получить всех пользователей с активной подпиской (для рассылки)
+export function getActiveSubscribersIds(): number[] {
+  const nowSec = Math.floor(Date.now() / 1000);
+  const rows = getDb().prepare(`
+    SELECT DISTINCT telegramUserId FROM subscriptions
+    WHERE active = 1 AND endAt > ?
+  `).all(nowSec) as { telegramUserId: number }[];
+  return rows.map(r => r.telegramUserId);
+}
+
+// Найти подписки, истекающие в определённый период (для напоминаний)
+export function findExpiringSubscriptions(inDays: number): Subscription[] {
+  const nowSec = Math.floor(Date.now() / 1000);
+  const targetStart = nowSec + (inDays * 24 * 60 * 60) - (12 * 60 * 60); // -12 часов
+  const targetEnd = nowSec + (inDays * 24 * 60 * 60) + (12 * 60 * 60);   // +12 часов
+  
+  const rows = getDb().prepare(`
+    SELECT * FROM subscriptions 
+    WHERE active = 1 AND endAt >= ? AND endAt <= ?
+  `).all(targetStart, targetEnd) as Subscription[];
+  return rows;
+}
+
+// Таблица для отслеживания отправленных напоминаний о скором истечении
+export function initExpiryRemindersTable(): void {
+  getDb().exec(`
+    CREATE TABLE IF NOT EXISTS expiry_reminders (
+      subscriptionId INTEGER NOT NULL,
+      daysBeforeExpiry INTEGER NOT NULL,
+      sentAt INTEGER NOT NULL,
+      PRIMARY KEY (subscriptionId, daysBeforeExpiry)
+    );
+  `);
+}
+
+export function wasExpiryReminderSent(subscriptionId: number, daysBeforeExpiry: number): boolean {
+  const row = getDb().prepare(`
+    SELECT 1 FROM expiry_reminders WHERE subscriptionId = ? AND daysBeforeExpiry = ?
+  `).get(subscriptionId, daysBeforeExpiry);
+  return !!row;
+}
+
+export function markExpiryReminderSent(subscriptionId: number, daysBeforeExpiry: number): void {
+  const nowSec = Math.floor(Date.now() / 1000);
+  getDb().prepare(`
+    INSERT OR REPLACE INTO expiry_reminders (subscriptionId, daysBeforeExpiry, sentAt)
+    VALUES (?, ?, ?)
+  `).run(subscriptionId, daysBeforeExpiry, nowSec);
+}
+
+// Получить всех пользователей с их статусом подписки (для экспорта)
+export type UserExportData = {
+  telegramUserId: number;
+  username: string | null;
+  firstName: string | null;
+  lastName: string | null;
+  phone: string | null;
+  hasActiveSubscription: boolean;
+  subscriptionEndAt: number | null;
+  subscriptionPlanCode: string | null;
+  purchasedPlanCode: string | null;
+  totalPaid: number;
+  lastPaymentAt: number | null;
+  lastPaymentAmount: number | null;
+};
+
+export function getAllUsersForExport(): UserExportData[] {
+  const nowSec = Math.floor(Date.now() / 1000);
+  
+  // Получаем всех пользователей из разных источников
+  const rows = getDb().prepare(`
+    SELECT 
+      COALESCE(u.telegramUserId, s.telegramUserId, p.telegramUserId) as telegramUserId,
+      u.username,
+      u.firstName,
+      u.lastName,
+      u.phone,
+      s.endAt as subscriptionEndAt,
+      s.planCode as subscriptionPlanCode,
+      s.active as hasActiveSub,
+      p.totalPaid,
+      p.lastPaymentAt,
+      p.lastPlanCode as purchasedPlanCode,
+      p.lastAmount as lastPaymentAmount
+    FROM (
+      SELECT DISTINCT telegramUserId FROM users
+      UNION
+      SELECT DISTINCT telegramUserId FROM subscriptions
+      UNION  
+      SELECT DISTINCT telegramUserId FROM payments WHERE status = 'success'
+    ) all_users
+    LEFT JOIN users u ON all_users.telegramUserId = u.telegramUserId
+    LEFT JOIN (
+      SELECT telegramUserId, endAt, planCode, active,
+             ROW_NUMBER() OVER (PARTITION BY telegramUserId ORDER BY endAt DESC) as rn
+      FROM subscriptions WHERE active = 1
+    ) s ON all_users.telegramUserId = s.telegramUserId AND s.rn = 1
+    LEFT JOIN (
+      SELECT 
+        telegramUserId, 
+        SUM(amount) as totalPaid,
+        MAX(paidAt) as lastPaymentAt,
+        (SELECT planCode FROM payments p2 WHERE p2.telegramUserId = payments.telegramUserId AND p2.status = 'success' ORDER BY paidAt DESC LIMIT 1) as lastPlanCode,
+        (SELECT amount FROM payments p3 WHERE p3.telegramUserId = payments.telegramUserId AND p3.status = 'success' ORDER BY paidAt DESC LIMIT 1) as lastAmount
+      FROM payments 
+      WHERE status = 'success'
+      GROUP BY telegramUserId
+    ) p ON all_users.telegramUserId = p.telegramUserId
+    ORDER BY s.endAt DESC NULLS LAST, all_users.telegramUserId
+  `).all() as Array<{
+    telegramUserId: number;
+    username: string | null;
+    firstName: string | null;
+    lastName: string | null;
+    phone: string | null;
+    subscriptionEndAt: number | null;
+    subscriptionPlanCode: string | null;
+    hasActiveSub: number | null;
+    totalPaid: number | null;
+    lastPaymentAt: number | null;
+    purchasedPlanCode: string | null;
+    lastPaymentAmount: number | null;
+  }>;
+
+  return rows.map(row => ({
+    telegramUserId: row.telegramUserId,
+    username: row.username,
+    firstName: row.firstName,
+    lastName: row.lastName,
+    phone: row.phone,
+    hasActiveSubscription: !!(row.hasActiveSub && row.subscriptionEndAt && row.subscriptionEndAt > nowSec),
+    subscriptionEndAt: row.subscriptionEndAt,
+    subscriptionPlanCode: row.subscriptionPlanCode,
+    purchasedPlanCode: row.purchasedPlanCode,
+    totalPaid: row.totalPaid || 0,
+    lastPaymentAt: row.lastPaymentAt,
+    lastPaymentAmount: row.lastPaymentAmount,
+  }));
+}

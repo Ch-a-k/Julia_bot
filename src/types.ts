@@ -1,9 +1,10 @@
-export type PlanCode = 'P1M' | 'P2M';
+export type PlanCode = 'P1M' | 'P2M' | 'TEST';
 
 export const PLAN_DETAILS: Record<PlanCode, { months: number; title: string }>
   = {
     P1M: { months: 1, title: 'Подписка на 1 месяц' },
     P2M: { months: 2, title: 'Подписка на 2 месяца' },
+    TEST: { months: 0, title: 'Тестовая подписка' },
   };
 
 export type InvoiceStatus =
