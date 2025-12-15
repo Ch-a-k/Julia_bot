@@ -2,7 +2,7 @@ import { Telegraf, Markup, Context, Telegram } from 'telegraf';
 import { config, isAdmin } from './config.js';
 import { PLAN_DETAILS, type PlanCode } from './types.js';
 import { createInvoice, fetchInvoiceStatus } from './monopay.js';
-import { insertPayment, hasActiveSubscription, getLastPendingPayment, markPaymentStatus, createOrExtendSubscription, getSetting, setSetting, getAllActiveSubscriptions, createSubscriptionForDays, getUserSubscription, saveUserInfo, getExtendedActiveSubscriptions, findUsersByQuery, getActiveSubscribersIds, getUserInfo, getAllUsersForExport, type ExtendedSubscriptionInfo } from './db.js';
+import { insertPayment, hasActiveSubscription, getLastPendingPayment, markPaymentStatus, createOrExtendSubscription, getSetting, setSetting, getAllActiveSubscriptions, createSubscriptionForDays, getUserSubscription, saveUserInfo, getExtendedActiveSubscriptions, findUsersByQuery, getActiveSubscribersIds, getUserInfo, getAllUsersForExport, tryMarkPaymentSuccess, type ExtendedSubscriptionInfo } from './db.js';
 import { runExpiredSubscriptionsCheck, getExpiredSubscriptionsInfo } from './scheduler.js';
 
 // Форматирование даты на русском
@@ -88,6 +88,9 @@ export function createBot(): Telegraf<BotContext> {
     [Markup.button.callback('Подписка 1 месяц — 700₴', 'buy:P1M')],
     [Markup.button.callback('Подписка 2 месяца — 1200₴', 'buy:P2M')],
   ]);
+
+  // Экспортируемая функция для создания клавиатуры тарифов (для scheduler)
+  (bot as any).getTariffsKeyboard = () => tariffsKeyboard;
 
   const mainMenuInline = () => Markup.inlineKeyboard([
     [Markup.button.callback('Оформить подписку', 'menu:subscribe')],
@@ -188,9 +191,12 @@ export function createBot(): Telegraf<BotContext> {
         try {
           const status = await fetchInvoiceStatus(pending.invoiceId);
           if (status.status === 'success') {
-            const months = PLAN_DETAILS[pending.planCode].months;
-            createOrExtendSubscription(user.id, config.telegramChannelId, pending.planCode, months, nowSec);
-            markPaymentStatus(pending.invoiceId, 'success', nowSec);
+            // Атомарная проверка: если платёж уже обработан, пропускаем
+            const updated = tryMarkPaymentSuccess(pending.invoiceId, nowSec);
+            if (updated) {
+              const months = PLAN_DETAILS[pending.planCode].months;
+              createOrExtendSubscription(user.id, config.telegramChannelId, pending.planCode, months, nowSec);
+            }
             const link = await generateInviteLinkFor(user.id);
             const kb = Markup.inlineKeyboard([
               link ? [Markup.button.url('Перейти в канал', link)] : [],
@@ -218,18 +224,23 @@ export function createBot(): Telegraf<BotContext> {
     return next();
   });
 
-  // Admin-only: save photo file_id to settings (send a photo with caption "save")
+  // Обработчик фото: для админа — сохраняет как приветственное, для всех — показывает file_id
   bot.on('photo', async (ctx) => {
-    const adminOk = isAdmin(ctx.from?.id);
-    if (!adminOk) return; // ignore non-admin
     const photos = ctx.message.photo;
     if (!photos || photos.length === 0) return;
     const best = photos[photos.length - 1];
     if (!best) return;
     const fileId = (best as any).file_id as string | undefined;
     if (!fileId) return;
-    setSetting('WELCOME_PHOTO_FILE_ID', fileId);
-    await ctx.reply('Сохранено фото приветствия (file_id).');
+
+    if (isAdmin(ctx.from?.id)) {
+      // Админ: сохраняем как приветственное фото
+      setSetting('WELCOME_PHOTO_FILE_ID', fileId);
+      await ctx.reply(`✅ Сохранено как приветственное фото.\n\nfile_id: <code>${fileId}</code>`, { parse_mode: 'HTML' });
+    } else {
+      // Обычный пользователь: просто показываем file_id (для отладки)
+      await ctx.reply(`file_id: ${fileId}`);
+    }
   });
 
   // Helper: show own user id
@@ -443,7 +454,7 @@ export function createBot(): Telegraf<BotContext> {
 
   // Обработка текстовых сообщений для broadcast
   bot.on('text', async (ctx, next) => {
-    if (!(config.adminUserId && ctx.from?.id === config.adminUserId)) {
+    if (!isAdmin(ctx.from?.id)) {
       return next();
     }
 
@@ -832,17 +843,6 @@ export function createBot(): Telegraf<BotContext> {
     await ctx.reply(help, { parse_mode: 'HTML' });
   });
 
-  // Helper: send file_id for any photo sent to the bot (to configure welcome photo reliably)
-  bot.on('photo', async (ctx) => {
-    try {
-      const photos = ctx.message.photo;
-      if (!photos || photos.length === 0) return;
-      const best = photos[photos.length - 1];
-      if (!best) return;
-      await ctx.reply(`file_id: ${(best as any).file_id}`);
-    } catch {}
-  });
-
   bot.action(/buy:(P1M|P2M)/, async (ctx) => {
     const plan = (ctx.match as RegExpExecArray)[1] as PlanCode;
     const user = ctx.from;
@@ -910,6 +910,61 @@ export function createBot(): Telegraf<BotContext> {
       if (isPhoto) await ctx.editMessageCaption(text, opts); else await ctx.editMessageText(text, opts);
     } catch (e) {
       await ctx.reply('Не удалось создать счёт. Попробуйте позже.');
+    }
+  });
+
+  // === ПРОВЕРКА ПРИ ВСТУПЛЕНИИ В КАНАЛ ===
+  // Когда кто-то вступает в канал, проверяем есть ли у него подписка
+  bot.on('chat_member', async (ctx) => {
+    try {
+      const update = ctx.chatMember;
+      if (!update) return;
+
+      const chatId = update.chat.id.toString();
+      const userId = update.new_chat_member.user.id;
+      const newStatus = update.new_chat_member.status;
+      const oldStatus = update.old_chat_member.status;
+
+      // Проверяем только вступления (был left/kicked, стал member/restricted)
+      const wasOut = oldStatus === 'left' || oldStatus === 'kicked';
+      const isIn = newStatus === 'member' || newStatus === 'restricted' || newStatus === 'administrator' || newStatus === 'creator';
+      
+      if (!wasOut || !isIn) return;
+
+      // Пропускаем админов
+      if (isAdmin(userId)) return;
+
+      console.log(`[ChatMember] Пользователь ${userId} вступил в канал ${chatId}`);
+
+      // Проверяем подписку
+      const nowSec = Math.floor(Date.now() / 1000);
+      const hasAccess = hasActiveSubscription(userId, chatId, nowSec);
+
+      if (!hasAccess) {
+        console.log(`[ChatMember] У пользователя ${userId} нет активной подписки — удаляем`);
+        
+        // Удаляем из канала
+        await removeUserFromChannel(ctx.telegram, chatId, userId);
+
+        // Отправляем сообщение с кнопками тарифов
+        try {
+          const message = [
+            '🔒 Доступ закрыт',
+            '',
+            'Для доступа к каналу необходима активная подписка.',
+            '',
+            'Выберите тариф:'
+          ].join('\n');
+          await ctx.telegram.sendMessage(userId, message, { 
+            parse_mode: 'HTML',
+            reply_markup: tariffsKeyboard.reply_markup 
+          });
+        } catch (err) {
+          console.error(`[ChatMember] Не удалось отправить сообщение userId=${userId}:`, err);
+        }
+      }
+    } catch (err) {
+      console.error('[ChatMember] Ошибка обработки события:', err);
     }
   });
 

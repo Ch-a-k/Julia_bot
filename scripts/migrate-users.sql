@@ -24,3 +24,10 @@ INSERT OR IGNORE INTO subscriptions (telegramUserId, chatId, planCode, startAt, 
 SELECT 'Добавлено пользователей:' as info, COUNT(*) as count FROM users;
 SELECT 'Добавлено подписок:' as info, COUNT(*) as count FROM subscriptions WHERE chatId='-1002973843273' AND active=1;
 
+
+
+
+
+
+
+

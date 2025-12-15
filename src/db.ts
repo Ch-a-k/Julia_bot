@@ -84,12 +84,27 @@ export function initDb(): void {
       phone TEXT,
       updatedAt INTEGER NOT NULL
     );
+
+    -- Напоминания о скором истечении подписки
+    CREATE TABLE IF NOT EXISTS expiry_reminders (
+      subscriptionId INTEGER NOT NULL,
+      daysBeforeExpiry INTEGER NOT NULL,
+      sentAt INTEGER NOT NULL,
+      PRIMARY KEY (subscriptionId, daysBeforeExpiry)
+    );
   `);
 }
 
 export function getDb(): Database.Database {
   if (!db) throw new Error('DB is not initialized');
   return db;
+}
+
+export function closeDb(): void {
+  if (db) {
+    db.close();
+    console.log('[DB] Соединение закрыто');
+  }
 }
 
 export function insertPayment(p: Omit<Payment, 'id'>): void {
@@ -212,6 +227,16 @@ export function markPaymentStatus(invoiceId: string, status: string, paidAt?: nu
     status,
     paidAt: paidAt ?? null,
   });
+}
+
+// Атомарная проверка и обновление статуса платежа (защита от race condition)
+// Возвращает true если статус был обновлён, false если платёж уже обработан
+export function tryMarkPaymentSuccess(invoiceId: string, paidAt: number): boolean {
+  const result = getDb().prepare(
+    `UPDATE payments SET status='success', paidAt=@paidAt 
+     WHERE invoiceId=@invoiceId AND status IN ('created','processing','holded')`
+  ).run({ invoiceId, paidAt });
+  return result.changes > 0;
 }
 
 // Получить все активные подписки (для рассылки)
@@ -351,6 +376,7 @@ export function getExtendedActiveSubscriptions(): ExtendedSubscriptionInfo[] {
 }
 
 // Поиск пользователей по ID, username или части имени
+// Ищет в таблице users И среди активных подписчиков
 export function findUsersByQuery(query: string): number[] {
   const q = query.trim().toLowerCase();
   
@@ -359,7 +385,7 @@ export function findUsersByQuery(query: string): number[] {
     return [parseInt(q, 10)];
   }
   
-  // Ищем по username или имени
+  // Ищем по username или имени в таблице users
   const rows = getDb().prepare(`
     SELECT DISTINCT telegramUserId FROM users
     WHERE LOWER(username) LIKE ? 
@@ -369,6 +395,18 @@ export function findUsersByQuery(query: string): number[] {
   `).all(`%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`) as { telegramUserId: number }[];
   
   return rows.map(r => r.telegramUserId);
+}
+
+// Поиск подписчика по точному username (без @)
+export function findSubscriberByUsername(username: string): number | null {
+  const clean = username.replace('@', '').trim().toLowerCase();
+  if (!clean) return null;
+  
+  const row = getDb().prepare(`
+    SELECT telegramUserId FROM users WHERE LOWER(username) = ?
+  `).get(clean) as { telegramUserId: number } | undefined;
+  
+  return row?.telegramUserId ?? null;
 }
 
 // Получить всех пользователей с активной подпиской (для рассылки)

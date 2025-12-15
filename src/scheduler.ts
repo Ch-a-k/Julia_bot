@@ -1,10 +1,16 @@
 import cron from 'node-cron';
-import { findExpiredActiveSubscriptions, deactivateSubscription, listKnownUserIds, hasActiveSubscription, getLastReminderAt, setReminderSentNow, getDb, createOrExtendSubscription, findExpiringSubscriptions, wasExpiryReminderSent, markExpiryReminderSent, initExpiryRemindersTable } from './db.js';
+import { findExpiredActiveSubscriptions, deactivateSubscription, listKnownUserIds, hasActiveSubscription, getLastReminderAt, setReminderSentNow, getDb, createOrExtendSubscription, findExpiringSubscriptions, wasExpiryReminderSent, markExpiryReminderSent, initExpiryRemindersTable, tryMarkPaymentSuccess } from './db.js';
 import { config } from './config.js';
-import { Telegram } from 'telegraf';
+import { Telegram, Markup } from 'telegraf';
 import { removeUserFromChannel } from './bot.js';
 import { PLAN_DETAILS, type PlanCode } from './types.js';
 import { fetchInvoiceStatus } from './monopay.js';
+
+// Клавиатура тарифов для сообщений об истечении
+const tariffsKeyboard = Markup.inlineKeyboard([
+  [Markup.button.callback('Подписка 1 месяц — 700₴', 'buy:P1M')],
+  [Markup.button.callback('Подписка 2 месяца — 1200₴', 'buy:P2M')],
+]);
 
 // Часовой пояс для cron (Киев)
 const CRON_TIMEZONE = 'Europe/Kiev';
@@ -25,102 +31,118 @@ export function startScheduler(telegram: Telegram): void {
 
   // === НАПОМИНАНИЯ ЗА 3 ДНЯ ДО ИСТЕЧЕНИЯ (в 11:00) ===
   cron.schedule('0 11 * * *', async () => {
-    console.log(`[Scheduler] Проверка подписок, истекающих через 3 дня...`);
-    const expiring = findExpiringSubscriptions(3);
-    let sent = 0;
-    
-    for (const sub of expiring) {
-      if (wasExpiryReminderSent(sub.id, 3)) continue;
+    try {
+      console.log(`[Scheduler] Проверка подписок, истекающих через 3 дня...`);
+      const expiring = findExpiringSubscriptions(3);
+      let sent = 0;
       
-      const endDate = formatDateRu(sub.endAt);
-      const message = [
-        '💫 Напоминание о подписке',
-        '',
-        `Ваша подписка на канал «Психосоматика. Живая правда» заканчивается <b>${endDate}</b>.`,
-        '',
-        'Чтобы не потерять доступ к материалам и встречам, продлите подписку заранее.',
-        '',
-        'Благодарю, что вы с нами! 🤍'
-      ].join('\n');
+      for (const sub of expiring) {
+        if (wasExpiryReminderSent(sub.id, 3)) continue;
+        
+        const endDate = formatDateRu(sub.endAt);
+        const message = [
+          '💫 Напоминание о подписке',
+          '',
+          `Ваша подписка на канал «Психосоматика. Живая правда» заканчивается <b>${endDate}</b>.`,
+          '',
+          'Чтобы не потерять доступ к материалам и встречам, продлите подписку заранее.',
+          '',
+          'Благодарю, что вы с нами! 🤍'
+        ].join('\n');
 
-      try {
-        await telegram.sendMessage(sub.telegramUserId, message, { parse_mode: 'HTML' });
-        markExpiryReminderSent(sub.id, 3);
-        sent++;
-        await new Promise(resolve => setTimeout(resolve, 100));
-      } catch (err) {
-        console.error(`[Scheduler] Ошибка напоминания за 3 дня userId=${sub.telegramUserId}:`, err);
+        try {
+          await telegram.sendMessage(sub.telegramUserId, message, { parse_mode: 'HTML' });
+          markExpiryReminderSent(sub.id, 3);
+          sent++;
+          await new Promise(resolve => setTimeout(resolve, 100));
+        } catch (err) {
+          console.error(`[Scheduler] Ошибка напоминания за 3 дня userId=${sub.telegramUserId}:`, err);
+        }
       }
+      console.log(`[Scheduler] Напоминания за 3 дня: отправлено ${sent}`);
+    } catch (err) {
+      console.error('[Scheduler] Общая ошибка задачи напоминаний за 3 дня:', err);
     }
-    console.log(`[Scheduler] Напоминания за 3 дня: отправлено ${sent}`);
   }, { timezone: CRON_TIMEZONE });
 
   // === НАПОМИНАНИЕ ЗА 1 ДЕНЬ ДО ИСТЕЧЕНИЯ (в 18:00) ===
   cron.schedule('0 18 * * *', async () => {
-    console.log(`[Scheduler] Проверка подписок, истекающих завтра...`);
-    const expiring = findExpiringSubscriptions(1);
-    let sent = 0;
-    
-    for (const sub of expiring) {
-      if (wasExpiryReminderSent(sub.id, 1)) continue;
+    try {
+      console.log(`[Scheduler] Проверка подписок, истекающих завтра...`);
+      const expiring = findExpiringSubscriptions(1);
+      let sent = 0;
       
-      const message = [
-        '⏰ Подписка заканчивается завтра',
-        '',
-        'Завтра заканчивается ваша подписка на канал «Психосоматика. Живая правда».',
-        '',
-        'Продлите сейчас, чтобы сохранить доступ к каналу и не пропустить новые материалы.',
-        '',
-        'Нажмите /start в боте для продления. 🤍'
-      ].join('\n');
+      for (const sub of expiring) {
+        if (wasExpiryReminderSent(sub.id, 1)) continue;
+        
+        const message = [
+          '⏰ Подписка заканчивается завтра',
+          '',
+          'Завтра заканчивается ваша подписка на канал «Психосоматика. Живая правда».',
+          '',
+          'Продлите сейчас, чтобы сохранить доступ к каналу и не пропустить новые материалы.',
+          '',
+          'Нажмите /start в боте для продления. 🤍'
+        ].join('\n');
 
-      try {
-        await telegram.sendMessage(sub.telegramUserId, message, { parse_mode: 'HTML' });
-        markExpiryReminderSent(sub.id, 1);
-        sent++;
-        await new Promise(resolve => setTimeout(resolve, 100));
-      } catch (err) {
-        console.error(`[Scheduler] Ошибка напоминания за 1 день userId=${sub.telegramUserId}:`, err);
+        try {
+          await telegram.sendMessage(sub.telegramUserId, message, { parse_mode: 'HTML' });
+          markExpiryReminderSent(sub.id, 1);
+          sent++;
+          await new Promise(resolve => setTimeout(resolve, 100));
+        } catch (err) {
+          console.error(`[Scheduler] Ошибка напоминания за 1 день userId=${sub.telegramUserId}:`, err);
+        }
       }
+      console.log(`[Scheduler] Напоминания за 1 день: отправлено ${sent}`);
+    } catch (err) {
+      console.error('[Scheduler] Общая ошибка задачи напоминаний за 1 день:', err);
     }
-    console.log(`[Scheduler] Напоминания за 1 день: отправлено ${sent}`);
   }, { timezone: CRON_TIMEZONE });
 
   // === ОБРАБОТКА ИСТЁКШИХ ПОДПИСОК (в 10:15 и 22:15) ===
   cron.schedule('15 10,22 * * *', async () => {
-    console.log(`[Scheduler] Проверка истёкших подписок...`);
-    const nowSec = Math.floor(Date.now() / 1000);
-    const expired = findExpiredActiveSubscriptions(nowSec);
-    console.log(`[Scheduler] Найдено истёкших подписок: ${expired.length}`);
-    
-    for (const sub of expired) {
-      console.log(`[Scheduler] Обработка userId=${sub.telegramUserId}, endAt=${sub.endAt}, now=${nowSec}`);
-      try {
-        await removeUserFromChannel(telegram, config.telegramChannelId, sub.telegramUserId);
-        console.log(`[Scheduler] Удалён из канала: ${sub.telegramUserId}`);
-      } catch (err) {
-        console.error(`[Scheduler] Ошибка удаления из канала userId=${sub.telegramUserId}:`, err);
+    try {
+      console.log(`[Scheduler] Проверка истёкших подписок...`);
+      const nowSec = Math.floor(Date.now() / 1000);
+      const expired = findExpiredActiveSubscriptions(nowSec);
+      console.log(`[Scheduler] Найдено истёкших подписок: ${expired.length}`);
+      
+      for (const sub of expired) {
+        console.log(`[Scheduler] Обработка userId=${sub.telegramUserId}, chatId=${sub.chatId}, endAt=${sub.endAt}, now=${nowSec}`);
+        try {
+          // Используем chatId из подписки, а не из конфига
+          await removeUserFromChannel(telegram, sub.chatId, sub.telegramUserId);
+          console.log(`[Scheduler] Удалён из канала ${sub.chatId}: ${sub.telegramUserId}`);
+        } catch (err) {
+          console.error(`[Scheduler] Ошибка удаления из канала userId=${sub.telegramUserId}:`, err);
+        }
+        deactivateSubscription(sub.id);
+        try {
+          const message = [
+            '😔 Подписка завершена',
+            '',
+            'Срок вашей подписки на канал «Психосоматика. Живая правда» истёк.',
+            '',
+            'Доступ к каналу закрыт, но вы всегда можете вернуться!',
+            '',
+            'Благодарю за время, проведённое вместе. Буду рада видеть вас снова! 🤍',
+            '',
+            'Выберите тариф для продления:'
+          ].join('\n');
+          await telegram.sendMessage(sub.telegramUserId, message, { 
+            parse_mode: 'HTML',
+            reply_markup: tariffsKeyboard.reply_markup
+          });
+          console.log(`[Scheduler] Уведомление отправлено: ${sub.telegramUserId}`);
+        } catch (err) {
+          console.error(`[Scheduler] Ошибка отправки уведомления userId=${sub.telegramUserId}:`, err);
+        }
       }
-      deactivateSubscription(sub.id);
-      try {
-        const message = [
-          '😔 Подписка завершена',
-          '',
-          'Срок вашей подписки на канал «Психосоматика. Живая правда» истёк.',
-          '',
-          'Доступ к каналу закрыт, но вы всегда можете вернуться!',
-          '',
-          'Для продления нажмите /start в боте.',
-          '',
-          'Благодарю за время, проведённое вместе. Буду рада видеть вас снова! 🤍'
-        ].join('\n');
-        await telegram.sendMessage(sub.telegramUserId, message, { parse_mode: 'HTML' });
-        console.log(`[Scheduler] Уведомление отправлено: ${sub.telegramUserId}`);
-      } catch (err) {
-        console.error(`[Scheduler] Ошибка отправки уведомления userId=${sub.telegramUserId}:`, err);
-      }
+      console.log(`[Scheduler] Проверка завершена.`);
+    } catch (err) {
+      console.error('[Scheduler] Общая ошибка задачи обработки истёкших подписок:', err);
     }
-    console.log(`[Scheduler] Проверка завершена.`);
   }, { timezone: CRON_TIMEZONE });
 
   // Remind users without active subscription (daily at 10:00 Kyiv time)
@@ -156,13 +178,16 @@ export function startScheduler(telegram: Telegram): void {
       try {
         const status = await fetchInvoiceStatus(p.invoiceId);
         if (status.status === 'success') {
-          const months = PLAN_DETAILS[p.planCode].months;
           const nowSec = Math.floor(Date.now() / 1000);
-          createOrExtendSubscription(p.telegramUserId, config.telegramChannelId, p.planCode, months, nowSec);
-          db.prepare(`UPDATE payments SET status='success', paidAt=? WHERE invoiceId=?`).run(nowSec, p.invoiceId);
-          try {
-            await telegram.sendMessage(p.telegramUserId, 'Оплата получена! Перейдите в бота и получите ссылку на канал, если не получили.');
-          } catch {}
+          // Атомарная проверка: если платёж уже обработан другим процессом, пропускаем
+          const updated = tryMarkPaymentSuccess(p.invoiceId, nowSec);
+          if (updated) {
+            const months = PLAN_DETAILS[p.planCode].months;
+            createOrExtendSubscription(p.telegramUserId, config.telegramChannelId, p.planCode, months, nowSec);
+            try {
+              await telegram.sendMessage(p.telegramUserId, 'Оплата получена! Перейдите в бота и получите ссылку на канал, если не получили.');
+            } catch {}
+          }
         } else if (status.status === 'failure' || status.status === 'expired' || status.status === 'reversed') {
           db.prepare(`UPDATE payments SET status=? WHERE invoiceId=?`).run(status.status, p.invoiceId);
         }
@@ -184,10 +209,11 @@ export async function runExpiredSubscriptionsCheck(telegram: Telegram): Promise<
   let processed = 0;
   
   for (const sub of expired) {
-    console.log(`[Scheduler] Обработка userId=${sub.telegramUserId}, endAt=${sub.endAt} (${new Date(sub.endAt * 1000).toISOString()}), now=${nowSec}`);
+    console.log(`[Scheduler] Обработка userId=${sub.telegramUserId}, chatId=${sub.chatId}, endAt=${sub.endAt} (${new Date(sub.endAt * 1000).toISOString()}), now=${nowSec}`);
     try {
-      await removeUserFromChannel(telegram, config.telegramChannelId, sub.telegramUserId);
-      console.log(`[Scheduler] Удалён из канала: ${sub.telegramUserId}`);
+      // Используем chatId из подписки, а не из конфига
+      await removeUserFromChannel(telegram, sub.chatId, sub.telegramUserId);
+      console.log(`[Scheduler] Удалён из канала ${sub.chatId}: ${sub.telegramUserId}`);
     } catch (err) {
       const msg = `Ошибка удаления userId=${sub.telegramUserId}: ${err}`;
       console.error(`[Scheduler] ${msg}`);
@@ -195,7 +221,17 @@ export async function runExpiredSubscriptionsCheck(telegram: Telegram): Promise<
     }
     deactivateSubscription(sub.id);
     try {
-      await telegram.sendMessage(sub.telegramUserId, 'Срок вашей подписки истёк. Доступ к каналу закрыт. Продлите подписку в боте, чтобы продолжить участие.');
+      const message = [
+        '😔 Подписка завершена',
+        '',
+        'Срок вашей подписки истёк. Доступ к каналу закрыт.',
+        '',
+        'Выберите тариф для продления:'
+      ].join('\n');
+      await telegram.sendMessage(sub.telegramUserId, message, {
+        parse_mode: 'HTML',
+        reply_markup: tariffsKeyboard.reply_markup
+      });
       console.log(`[Scheduler] Уведомление отправлено: ${sub.telegramUserId}`);
       processed++;
     } catch (err) {

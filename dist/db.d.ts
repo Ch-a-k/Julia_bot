@@ -1,0 +1,98 @@
+import Database from 'better-sqlite3';
+import type { PlanCode } from './types.js';
+export type Subscription = {
+    id: number;
+    telegramUserId: number;
+    chatId: string;
+    planCode: PlanCode;
+    startAt: number;
+    endAt: number;
+    active: number;
+};
+export type Payment = {
+    id: number;
+    invoiceId: string;
+    telegramUserId: number;
+    planCode: PlanCode;
+    amount: number;
+    status: string;
+    createdAt: number;
+    paidAt?: number | null;
+};
+export type UserInfo = {
+    telegramUserId: number;
+    username?: string | null;
+    firstName?: string | null;
+    lastName?: string | null;
+    phone?: string | null;
+    updatedAt: number;
+};
+export declare function initDb(): void;
+export declare function getDb(): Database.Database;
+export declare function closeDb(): void;
+export declare function insertPayment(p: Omit<Payment, 'id'>): void;
+export declare function updatePaymentStatus(invoiceId: string, status: string, paidAt?: number): void;
+export declare function createOrExtendSubscription(telegramUserId: number, chatId: string, planCode: PlanCode, months: number, nowSec: number): Subscription;
+export declare function findExpiredActiveSubscriptions(nowSec: number): Subscription[];
+export declare function deactivateSubscription(id: number): void;
+export declare function hasActiveSubscription(telegramUserId: number, chatId: string, nowSec: number): boolean;
+export declare function listKnownUserIds(): number[];
+export declare function getLastReminderAt(telegramUserId: number): number | null;
+export declare function setReminderSentNow(telegramUserId: number, nowSec: number): void;
+export declare function getSetting(key: string): string | null;
+export declare function setSetting(key: string, value: string): void;
+export declare function getLastPendingPayment(telegramUserId: number): {
+    invoiceId: string;
+    planCode: PlanCode;
+} | null;
+export declare function markPaymentStatus(invoiceId: string, status: string, paidAt?: number): void;
+export declare function tryMarkPaymentSuccess(invoiceId: string, paidAt: number): boolean;
+export declare function getAllActiveSubscriptions(): Subscription[];
+export declare function createSubscriptionForDays(telegramUserId: number, chatId: string, days: number): Subscription;
+export declare function getUserSubscription(telegramUserId: number, chatId: string): Subscription | null;
+export declare function revokeUserSubscription(telegramUserId: number, chatId: string): boolean;
+export declare function saveUserInfo(user: {
+    telegramUserId: number;
+    username?: string | null;
+    firstName?: string | null;
+    lastName?: string | null;
+    phone?: string | null;
+}): void;
+export declare function getUserInfo(telegramUserId: number): UserInfo | null;
+export type ExtendedSubscriptionInfo = {
+    id: number;
+    telegramUserId: number;
+    planCode: PlanCode;
+    startAt: number;
+    endAt: number;
+    username?: string | null;
+    firstName?: string | null;
+    lastName?: string | null;
+    phone?: string | null;
+    paidAt?: number | null;
+    amount?: number | null;
+};
+export declare function getExtendedActiveSubscriptions(): ExtendedSubscriptionInfo[];
+export declare function findUsersByQuery(query: string): number[];
+export declare function findSubscriberByUsername(username: string): number | null;
+export declare function getActiveSubscribersIds(): number[];
+export declare function findExpiringSubscriptions(inDays: number): Subscription[];
+export declare function initExpiryRemindersTable(): void;
+export declare function wasExpiryReminderSent(subscriptionId: number, daysBeforeExpiry: number): boolean;
+export declare function markExpiryReminderSent(subscriptionId: number, daysBeforeExpiry: number): void;
+export type UserExportData = {
+    telegramUserId: number;
+    username: string | null;
+    firstName: string | null;
+    lastName: string | null;
+    phone: string | null;
+    hasActiveSubscription: boolean;
+    subscriptionEndAt: number | null;
+    subscriptionPlanCode: string | null;
+    purchasedPlanCode: string | null;
+    totalPaid: number;
+    lastPaymentAt: number | null;
+    lastPaymentAmount: number | null;
+};
+export declare function getAllUsersForExport(): UserExportData[];
+//# sourceMappingURL=db.d.ts.map
