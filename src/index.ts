@@ -15,23 +15,24 @@ async function main(): Promise<void> {
   console.log('[Boot] DB initialized');
   const bot = createBot();
   // eslint-disable-next-line no-console
-  console.log('[Boot] Launching bot (polling)…');
+  console.log('[Boot] Starting bot (polling)…');
   // Важно: Telegraf по умолчанию стартует polling с allowed_updates: []
   // что на стороне Telegram означает "всё, кроме chat_member..." — из-за этого
   // не приходят события вступления/выхода, и бот не может кикать неоплативших при входе.
   //
-  // Также ставим таймаут, чтобы контейнер не "висел молча" при проблемах связи с Telegram.
-  const launchPromise = bot.launch({
-    allowedUpdates: ['message', 'callback_query', 'chat_member', 'my_chat_member'],
-  });
-  await Promise.race([
-    launchPromise,
-    new Promise<void>((_resolve, reject) =>
-      setTimeout(() => reject(new Error('Bot launch timeout (no response from Telegram API within 30s)')), 30_000)
-    ),
-  ]);
+  // В режиме polling `bot.launch()` не завершается (это бесконечный цикл получения апдейтов),
+  // поэтому НЕ await'им его. Ошибки ловим через catch.
+  bot
+    .launch({
+      allowedUpdates: ['message', 'callback_query', 'chat_member', 'my_chat_member'],
+    })
+    .catch((e) => {
+      // eslint-disable-next-line no-console
+      console.error('[Boot] Bot polling crashed:', e);
+      process.exit(1);
+    });
   // eslint-disable-next-line no-console
-  console.log('[Boot] Bot launched');
+  console.log('[Boot] Polling started');
   startScheduler(bot.telegram);
   // eslint-disable-next-line no-console
   console.log('[Boot] Scheduler started');
