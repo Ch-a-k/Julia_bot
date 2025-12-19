@@ -7,7 +7,12 @@ async function main() {
     assertConfig();
     initDb();
     const bot = createBot();
-    await bot.launch();
+    // Важно: Telegraf по умолчанию стартует polling с allowed_updates: []
+    // что на стороне Telegram означает "всё, кроме chat_member..." — из-за этого
+    // не приходят события вступления/выхода, и бот не может кикать неоплативших при входе.
+    await bot.launch({
+        allowedUpdates: ['message', 'callback_query', 'chat_member', 'my_chat_member'],
+    });
     startScheduler(bot.telegram);
     startServer();
     // eslint-disable-next-line no-console

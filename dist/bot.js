@@ -2,7 +2,7 @@ import { Telegraf, Markup, Context, Telegram } from 'telegraf';
 import { config, isAdmin } from './config.js';
 import { PLAN_DETAILS } from './types.js';
 import { createInvoice, fetchInvoiceStatus } from './monopay.js';
-import { insertPayment, hasActiveSubscription, getLastPendingPayment, markPaymentStatus, createOrExtendSubscription, getSetting, setSetting, getAllActiveSubscriptions, createSubscriptionForDays, getUserSubscription, saveUserInfo, getExtendedActiveSubscriptions, findUsersByQuery, getActiveSubscribersIds, getUserInfo, getAllUsersForExport, tryMarkPaymentSuccess } from './db.js';
+import { insertPayment, hasActiveSubscription, getLastPendingPayment, markPaymentStatus, createOrExtendSubscription, getSetting, setSetting, getAllActiveSubscriptions, createSubscriptionForDays, getUserSubscription, saveUserInfo, getExtendedActiveSubscriptions, findUsersByQuery, getActiveSubscribersIds, getUserInfo, getAllUsersForExport, tryMarkPaymentSuccess, hasSuccessfulPayment } from './db.js';
 import { runExpiredSubscriptionsCheck, getExpiredSubscriptionsInfo } from './scheduler.js';
 // Форматирование даты на русском
 function formatDateRu(timestamp) {
@@ -156,7 +156,9 @@ export function createBot() {
                 await ctx.editMessageText(text, opts);
             return;
         }
-        const active = hasActiveSubscription(user.id, config.telegramChannelId, nowSec);
+        // Доступ даём только при активной подписке + наличии успешной оплаты.
+        // Это закрывает кейс "в subscriptions есть запись (например, тест/ручная), но в payments нет".
+        const active = hasActiveSubscription(user.id, config.telegramChannelId, nowSec) && hasSuccessfulPayment(user.id);
         const isPhoto = ctx.callbackQuery?.message?.photo;
         if (active) {
             const link = await generateInviteLinkFor(user.id);
@@ -589,6 +591,26 @@ export function createBot() {
         try {
             const subscription = createSubscriptionForDays(userId, config.telegramChannelId, days);
             const endDate = formatDateRu(subscription.endAt);
+            // Чтобы такие пользователи не считались "неоплатившими" по новой логике,
+            // фиксируем "подарочную" успешную оплату (amount=0) если у пользователя нет success оплат.
+            try {
+                if (!hasSuccessfulPayment(userId)) {
+                    const nowSec = Math.floor(Date.now() / 1000);
+                    insertPayment({
+                        invoiceId: `manual_grant_${userId}_${nowSec}`,
+                        telegramUserId: userId,
+                        planCode: 'TEST',
+                        amount: 0,
+                        status: 'success',
+                        createdAt: nowSec,
+                        paidAt: nowSec,
+                    });
+                }
+            }
+            catch (e) {
+                // не делаем фатальным — подписка уже создана
+                console.warn('[GrantSub] Не удалось записать "подарочную" оплату:', e);
+            }
             await ctx.reply(`✅ Подписка создана!\n\n` +
                 `👤 User ID: ${userId}\n` +
                 `📅 Срок: ${days} дн.\n` +
@@ -750,6 +772,51 @@ export function createBot() {
         ].join('\n');
         await ctx.reply(help, { parse_mode: 'HTML' });
     });
+    // Admin-only: diagnostics (bot permissions + subscriptions counters)
+    bot.command('diag', async (ctx) => {
+        if (!isAdmin(ctx.from?.id))
+            return;
+        try {
+            const me = await ctx.telegram.getMe();
+            const botId = me.id;
+            const now = new Date();
+            const nowSec = Math.floor(now.getTime() / 1000);
+            const myMember = await ctx.telegram.getChatMember(config.telegramChannelId, botId);
+            const status = myMember.status;
+            const canRestrict = myMember.can_restrict_members ?? myMember.canRestrictMembers;
+            const canInvite = myMember.can_invite_users ?? myMember.canInviteUsers;
+            const { findExpiredActiveSubscriptions, findExpiringSubscriptions } = await import('./db.js');
+            const expired = findExpiredActiveSubscriptions(nowSec);
+            const expiring24h = findExpiringSubscriptions(1);
+            const lines = [];
+            lines.push('🛠 <b>DIAG</b>');
+            lines.push(`🕒 now: <code>${now.toISOString()}</code>`);
+            try {
+                const kyiv = new Intl.DateTimeFormat('ru-RU', { timeZone: 'Europe/Kyiv', dateStyle: 'full', timeStyle: 'medium' }).format(now);
+                lines.push(`🇺🇦 Kyiv: <code>${kyiv}</code>`);
+            }
+            catch {
+                // ignore
+            }
+            lines.push(`📌 chatId (config): <code>${config.telegramChannelId}</code>`);
+            lines.push(`🤖 bot status in chat: <code>${status}</code>`);
+            lines.push(`🔒 can_restrict_members: <code>${String(!!canRestrict)}</code>`);
+            lines.push(`🔗 can_invite_users: <code>${String(!!canInvite)}</code>`);
+            lines.push('');
+            lines.push(`⛔️ expired(active=1,endAt<=now): <b>${expired.length}</b>`);
+            lines.push(`⏰ expiring(next 24h): <b>${expiring24h.length}</b>`);
+            if (expired.length > 0) {
+                const sample = expired.slice(0, 5).map(s => `• subId=${s.id} user=${s.telegramUserId} endAt=${s.endAt}`).join('\n');
+                lines.push('');
+                lines.push('<b>Пример истёкших:</b>');
+                lines.push(sample);
+            }
+            await ctx.reply(lines.join('\n'), { parse_mode: 'HTML' });
+        }
+        catch (err) {
+            await ctx.reply(`DIAG error: ${String(err).slice(0, 3500)}`);
+        }
+    });
     bot.action(/buy:(P1M|P2M)/, async (ctx) => {
         const plan = ctx.match[1];
         const user = ctx.from;
@@ -842,7 +909,7 @@ export function createBot() {
             console.log(`[ChatMember] Пользователь ${userId} вступил в канал ${chatId}`);
             // Проверяем подписку
             const nowSec = Math.floor(Date.now() / 1000);
-            const hasAccess = hasActiveSubscription(userId, chatId, nowSec);
+            const hasAccess = hasActiveSubscription(userId, chatId, nowSec) && hasSuccessfulPayment(userId);
             if (!hasAccess) {
                 console.log(`[ChatMember] У пользователя ${userId} нет активной подписки — удаляем`);
                 // Удаляем из канала
@@ -874,11 +941,47 @@ export function createBot() {
 }
 export async function removeUserFromChannel(telegram, chatId, userId) {
     try {
+        // Бан + разбан = "кик" с возможностью войти снова позже.
+        // Важно НЕ глотать ошибки: иначе кажется, что удалили, хотя Telegram мог вернуть 403/400.
         await telegram.banChatMember(chatId, userId);
-        await telegram.unbanChatMember(chatId, userId); // allow rejoin later
     }
-    catch {
-        // ignore errors
+    catch (err) {
+        const e = err;
+        const code = e?.response?.error_code;
+        const desc = e?.response?.description ?? String(err);
+        const descStr = typeof desc === 'string' ? desc : String(desc);
+        const upper = descStr.toUpperCase();
+        // Если пользователь уже не участник — считаем, что удалять не нужно.
+        const userNotParticipant = upper.includes('USER_NOT_PARTICIPANT') ||
+            upper.includes('USER IS NOT A MEMBER') ||
+            upper.includes('USER_NOT_FOUND') ||
+            upper.includes('PARTICIPANT_ID_INVALID') ||
+            upper.includes('MEMBER NOT FOUND');
+        if (userNotParticipant) {
+            console.log(`[Kick] userId=${userId} уже не участник чата ${chatId}`);
+            return;
+        }
+        // Более понятная подсказка по правам (частая причина 403/400 в каналах)
+        if (upper.includes('CHAT_ADMIN_REQUIRED') ||
+            upper.includes('NOT ENOUGH RIGHTS') ||
+            upper.includes('BOT IS NOT A MEMBER') ||
+            upper.includes('NEED ADMIN RIGHTS')) {
+            console.error(`[Kick] Похоже, у бота нет прав на удаление участников. ` +
+                `Проверьте: бот — администратор канала и включено право "Блокировать пользователей / Ban users".`);
+        }
+        console.error(`[Kick] Ошибка banChatMember chatId=${chatId} userId=${userId} code=${code} desc=${descStr}`);
+        throw err;
+    }
+    try {
+        // allow rejoin later
+        await telegram.unbanChatMember(chatId, userId, { only_if_banned: true });
+    }
+    catch (err) {
+        // Разбан может не требоваться/не поддерживаться — не делаем это фатальным, но логируем.
+        const e = err;
+        const code = e?.response?.error_code;
+        const desc = e?.response?.description ?? String(err);
+        console.warn(`[Kick] Предупреждение unbanChatMember chatId=${chatId} userId=${userId} code=${code} desc=${desc}`);
     }
 }
 //# sourceMappingURL=bot.js.map
