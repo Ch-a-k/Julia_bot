@@ -897,7 +897,9 @@ export function createBot(): Telegraf<BotContext> {
       lines.push(`🔒 can_restrict_members: <code>${String(!!canRestrict)}</code>`);
       lines.push(`🔗 can_invite_users: <code>${String(!!canInvite)}</code>`);
       lines.push('');
-      lines.push(`⛔️ expired(active=1,endAt<=now): <b>${expired.length}</b>`);
+      // Важно: в HTML parse_mode нельзя использовать символ "<" в тексте без экранирования.
+      // Используем знак "≤", чтобы Telegram не пытался парсить это как HTML-тег.
+      lines.push(`⛔️ expired(active=1,endAt≤now): <b>${expired.length}</b>`);
       lines.push(`⏰ expiring(next 24h): <b>${expiring24h.length}</b>`);
       if (expired.length > 0) {
         const sample = expired.slice(0, 5).map(s => `• subId=${s.id} user=${s.telegramUserId} endAt=${s.endAt}`).join('\n');
