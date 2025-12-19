@@ -77,6 +77,27 @@ export function insertPayment(p) {
     getDb().prepare(`INSERT INTO payments (invoiceId, telegramUserId, planCode, amount, status, createdAt, paidAt)
      VALUES (@invoiceId, @telegramUserId, @planCode, @amount, @status, @createdAt, @paidAt)`).run(p);
 }
+export function hasSuccessfulPayment(telegramUserId) {
+    const row = getDb().prepare(`SELECT 1 FROM payments WHERE telegramUserId=? AND status='success' LIMIT 1`).get(telegramUserId);
+    return !!row;
+}
+// Пользователи, по которым у нас есть хоть какие-то данные (старт/подписки/оплаты),
+// но при этом НЕТ ни одной успешной оплаты.
+export function listUserIdsWithoutSuccessfulPayment() {
+    const rows = getDb().prepare(`
+    SELECT DISTINCT uid FROM (
+      SELECT telegramUserId AS uid FROM users
+      UNION
+      SELECT telegramUserId AS uid FROM subscriptions
+      UNION
+      SELECT telegramUserId AS uid FROM payments
+    ) all_ids
+    WHERE NOT EXISTS (
+      SELECT 1 FROM payments p WHERE p.telegramUserId = all_ids.uid AND p.status = 'success'
+    )
+  `).all();
+    return rows.map(r => r.uid);
+}
 export function updatePaymentStatus(invoiceId, status, paidAt) {
     getDb().prepare(`UPDATE payments SET status=@status, paidAt=@paidAt WHERE invoiceId=@invoiceId`).run({ invoiceId, status, paidAt: paidAt ?? null });
 }
@@ -277,8 +298,19 @@ export function getActiveSubscribersIds() {
 // Найти подписки, истекающие в определённый период (для напоминаний)
 export function findExpiringSubscriptions(inDays) {
     const nowSec = Math.floor(Date.now() / 1000);
-    const targetStart = nowSec + (inDays * 24 * 60 * 60) - (12 * 60 * 60); // -12 часов
-    const targetEnd = nowSec + (inDays * 24 * 60 * 60) + (12 * 60 * 60); // +12 часов
+    // Старое окно (+/-12ч вокруг now+Nд) пропускало часть подписок (например, "завтра в 02:00").
+    // Для inDays=1 хотим напомнить всем, у кого окончание в ближайшие 24 часа.
+    // Для остальных оставляем прежнюю логику как более "точную" вокруг цели.
+    let targetStart;
+    let targetEnd;
+    if (inDays === 1) {
+        targetStart = nowSec;
+        targetEnd = nowSec + (24 * 60 * 60);
+    }
+    else {
+        targetStart = nowSec + (inDays * 24 * 60 * 60) - (12 * 60 * 60); // -12 часов
+        targetEnd = nowSec + (inDays * 24 * 60 * 60) + (12 * 60 * 60); // +12 часов
+    }
     const rows = getDb().prepare(`
     SELECT * FROM subscriptions 
     WHERE active = 1 AND endAt >= ? AND endAt <= ?

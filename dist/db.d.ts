@@ -31,6 +31,8 @@ export declare function initDb(): void;
 export declare function getDb(): Database.Database;
 export declare function closeDb(): void;
 export declare function insertPayment(p: Omit<Payment, 'id'>): void;
+export declare function hasSuccessfulPayment(telegramUserId: number): boolean;
+export declare function listUserIdsWithoutSuccessfulPayment(): number[];
 export declare function updatePaymentStatus(invoiceId: string, status: string, paidAt?: number): void;
 export declare function createOrExtendSubscription(telegramUserId: number, chatId: string, planCode: PlanCode, months: number, nowSec: number): Subscription;
 export declare function findExpiredActiveSubscriptions(nowSec: number): Subscription[];
