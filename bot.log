@@ -1,0 +1,14 @@
+[dotenv@17.2.2] injecting env (6) from .env -- tip: 🛠️  run anywhere with `dotenvx run -- yourcommand`
+Error: /root/projects/Julia_bot/node_modules/better-sqlite3/build/Release/better_sqlite3.node: invalid ELF header
+    at Module._extensions..node (node:internal/modules/cjs/loader:1586:18)
+    at Module.load (node:internal/modules/cjs/loader:1288:32)
+    at Module._load (node:internal/modules/cjs/loader:1104:12)
+    at Module.require (node:internal/modules/cjs/loader:1311:19)
+    at require (node:internal/modules/helpers:179:18)
+    at bindings (/root/projects/Julia_bot/node_modules/bindings/bindings.js:112:48)
+    at new Database (/root/projects/Julia_bot/node_modules/better-sqlite3/lib/database.js:48:64)
+    at initDb (file:///root/projects/Julia_bot/dist/db.js:10:10)
+    at main (file:///root/projects/Julia_bot/dist/index.js:8:5)
+    at file:///root/projects/Julia_bot/dist/index.js:27:1 {
+  code: 'ERR_DLOPEN_FAILED'
+}
