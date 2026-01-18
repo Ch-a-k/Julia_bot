@@ -988,6 +988,7 @@ export function createBot(): Telegraf<BotContext> {
       '━━━━ <b>⚙️ Прочее</b> ━━━━',
       '',
       '/invitelink — <i>Одноразовая ссылка на канал</i>',
+      '/diag — <i>диагностика бота и подписок</i>',
       '/whoami — <i>узнать ID</i>',
     ].join('\n');
     
