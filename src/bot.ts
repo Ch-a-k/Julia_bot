@@ -2,8 +2,8 @@ import { Telegraf, Markup, Context, Telegram } from 'telegraf';
 import { config, isAdmin } from './config.js';
 import { PLAN_DETAILS, type PlanCode } from './types.js';
 import { createInvoice, fetchInvoiceStatus } from './monopay.js';
-import { insertPayment, hasActiveSubscription, getLastPendingPayment, markPaymentStatus, createOrExtendSubscription, getSetting, setSetting, getAllActiveSubscriptions, createSubscriptionForDays, getUserSubscription, saveUserInfo, getExtendedActiveSubscriptions, findUsersByQuery, getActiveSubscribersIds, getUserInfo, getAllUsersForExport, tryMarkPaymentSuccess, hasSuccessfulPayment, type ExtendedSubscriptionInfo } from './db.js';
-import { runExpiredSubscriptionsCheck, getExpiredSubscriptionsInfo } from './scheduler.js';
+import { insertPayment, hasActiveSubscription, getLastPendingPayment, createOrExtendSubscription, getSetting, setSetting, createSubscriptionForDays, getUserSubscription, saveUserInfo, getExtendedActiveSubscriptions, findUsersByQuery, getActiveSubscribersIds, getUserInfo, getAllUsersForExport, tryMarkPaymentSuccess, hasSuccessfulPayment, type ExtendedSubscriptionInfo, hasValidatedPayment, createPaymentValidation, getPendingPaymentValidationForUser, markPaymentValidationConfirmed, recordUserChannelJoin, getRecentPayments } from './db.js';
+import { runExpiredSubscriptionsCheck, getExpiredSubscriptionsInfo, runPaymentsCheck } from './scheduler.js';
 
 // Форматирование даты на русском
 function formatDateRu(timestamp: number): string {
@@ -37,6 +37,26 @@ export type BotContext = Context & {
   };
 };
 
+export async function generateInviteLink(telegram: Telegram, userId: number): Promise<string | undefined> {
+  const nowSec = Math.floor(Date.now() / 1000);
+  try {
+    const expireIn = 24 * 60 * 60;
+    const invite = await telegram.createChatInviteLink(config.telegramChannelId, {
+      expire_date: nowSec + expireIn,
+      member_limit: 1,
+      creates_join_request: false,
+      name: `access-${userId}-${Date.now()}`,
+    } as any);
+    return (invite as any).invite_link || (invite as any).inviteLink;
+  } catch {
+    try {
+      return await telegram.exportChatInviteLink(config.telegramChannelId);
+    } catch {
+      return undefined;
+    }
+  }
+}
+
 export function createBot(): Telegraf<BotContext> {
   const bot = new Telegraf<BotContext>(config.telegramBotToken);
 
@@ -51,23 +71,7 @@ export function createBot(): Telegraf<BotContext> {
   }
 
   async function generateInviteLinkFor(userId: number): Promise<string | undefined> {
-    const nowSec = Math.floor(Date.now() / 1000);
-    try {
-      const expireIn = 24 * 60 * 60;
-      const invite = await bot.telegram.createChatInviteLink(config.telegramChannelId, {
-        expire_date: nowSec + expireIn,
-        member_limit: 1,
-        creates_join_request: false,
-        name: `access-${userId}-${Date.now()}`,
-      } as any);
-      return (invite as any).invite_link || (invite as any).inviteLink;
-    } catch {
-      try {
-        return await bot.telegram.exportChatInviteLink(config.telegramChannelId);
-      } catch {
-        return undefined;
-      }
-    }
+    return generateInviteLink(bot.telegram, userId);
   }
 
   const welcomeText = [
@@ -176,7 +180,7 @@ export function createBot(): Telegraf<BotContext> {
     }
     // Доступ даём только при активной подписке + наличии успешной оплаты.
     // Это закрывает кейс "в subscriptions есть запись (например, тест/ручная), но в payments нет".
-    const active = hasActiveSubscription(user.id, config.telegramChannelId, nowSec) && hasSuccessfulPayment(user.id);
+    const active = hasActiveSubscription(user.id, config.telegramChannelId, nowSec) && hasValidatedPayment(user.id);
     const isPhoto = (ctx.callbackQuery as any)?.message?.photo;
     if (active) {
       const link = await generateInviteLinkFor(user.id);
@@ -188,6 +192,39 @@ export function createBot(): Telegraf<BotContext> {
       const opts = { reply_markup: kb.reply_markup } as any;
       if (isPhoto) await ctx.editMessageCaption(text, opts); else await ctx.editMessageText(text, opts);
     } else {
+      const pendingValidation = getPendingPaymentValidationForUser(user.id, nowSec);
+      if (pendingValidation) {
+        const isInChannel = await isUserSubscribed(user.id);
+        if (isInChannel) {
+          const updated = markPaymentValidationConfirmed(pendingValidation.invoiceId, nowSec, nowSec);
+          if (updated) {
+            const months = PLAN_DETAILS[pendingValidation.planCode].months;
+            createOrExtendSubscription(user.id, config.telegramChannelId, pendingValidation.planCode, months, nowSec);
+          }
+          const link = await generateInviteLinkFor(user.id);
+          const kb = Markup.inlineKeyboard([
+            link ? [Markup.button.url('Перейти в канал', link)] : [],
+            [Markup.button.callback('◀︎ Назад в меню', 'menu:info')],
+          ].filter(r => r.length > 0));
+          const text = link ? 'Оплата подтверждена. Нажмите, чтобы перейти в канал.' : 'Оплата подтверждена, но не удалось создать ссылку. Свяжитесь с поддержкой.';
+          const opts = { reply_markup: kb.reply_markup } as any;
+          if (isPhoto) await ctx.editMessageCaption(text, opts); else await ctx.editMessageText(text, opts);
+          return;
+        }
+
+        const link = await generateInviteLinkFor(user.id);
+        const kb = Markup.inlineKeyboard([
+          link ? [Markup.button.url('Перейти в канал', link)] : [],
+          [Markup.button.callback('◀︎ Назад в меню', 'menu:info')],
+        ].filter(r => r.length > 0));
+        const text = link
+          ? 'Оплата в обработке. Перейдите по ссылке в течение 10 минут для подтверждения.'
+          : 'Оплата в обработке. Перейдите в бота и получите ссылку. На подтверждение есть 10 минут.';
+        const opts = { reply_markup: kb.reply_markup } as any;
+        if (isPhoto) await ctx.editMessageCaption(text, opts); else await ctx.editMessageText(text, opts);
+        return;
+      }
+
       const pending = getLastPendingPayment(user.id);
       if (pending) {
         try {
@@ -196,15 +233,53 @@ export function createBot(): Telegraf<BotContext> {
             // Атомарная проверка: если платёж уже обработан, пропускаем
             const updated = tryMarkPaymentSuccess(pending.invoiceId, nowSec);
             if (updated) {
-              const months = PLAN_DETAILS[pending.planCode].months;
-              createOrExtendSubscription(user.id, config.telegramChannelId, pending.planCode, months, nowSec);
+              const isInChannel = await isUserSubscribed(user.id);
+              if (isInChannel) {
+                const months = PLAN_DETAILS[pending.planCode].months;
+                createOrExtendSubscription(user.id, config.telegramChannelId, pending.planCode, months, nowSec);
+                createPaymentValidation({
+                  invoiceId: pending.invoiceId,
+                  telegramUserId: user.id,
+                  planCode: pending.planCode,
+                  paidAt: nowSec,
+                  deadlineAt: nowSec,
+                  status: 'confirmed',
+                  confirmedAt: nowSec,
+                  joinAt: nowSec,
+                });
+              } else {
+                createPaymentValidation({
+                  invoiceId: pending.invoiceId,
+                  telegramUserId: user.id,
+                  planCode: pending.planCode,
+                  paidAt: nowSec,
+                  deadlineAt: nowSec + 10 * 60,
+                  status: 'pending',
+                  confirmedAt: null,
+                  joinAt: null,
+                });
+              }
+            } else {
+              const isInChannel = await isUserSubscribed(user.id);
+              createPaymentValidation({
+                invoiceId: pending.invoiceId,
+                telegramUserId: user.id,
+                planCode: pending.planCode,
+                paidAt: nowSec,
+                deadlineAt: isInChannel ? nowSec : nowSec + 10 * 60,
+                status: isInChannel ? 'confirmed' : 'pending',
+                confirmedAt: isInChannel ? nowSec : null,
+                joinAt: isInChannel ? nowSec : null,
+              });
             }
             const link = await generateInviteLinkFor(user.id);
             const kb = Markup.inlineKeyboard([
               link ? [Markup.button.url('Перейти в канал', link)] : [],
               [Markup.button.callback('◀︎ Назад в меню', 'menu:info')],
             ].filter(r => r.length > 0));
-            const text = link ? 'Оплата найдена. Нажмите, чтобы перейти в канал.' : 'Оплата найдена, но не удалось создать ссылку. Свяжитесь с поддержкой.';
+            const text = link
+              ? 'Оплата найдена. Нажмите, чтобы перейти в канал (на подтверждение есть 10 минут).'
+              : 'Оплата найдена, но не удалось создать ссылку. Свяжитесь с поддержкой.';
             const opts = { reply_markup: kb.reply_markup } as any;
             if (isPhoto) await ctx.editMessageCaption(text, opts); else await ctx.editMessageText(text, opts);
             return;
@@ -633,6 +708,54 @@ export function createBot(): Telegraf<BotContext> {
     }
   });
 
+  // Admin-only: list recent payments (analytics)
+  bot.command('payments', async (ctx) => {
+    if (!isAdmin(ctx.from?.id)) return;
+    const args = ctx.message.text.split(' ').slice(1);
+    const limit = Math.min(Math.max(parseInt(args[0] || '10', 10) || 10, 1), 50);
+
+    const payments = getRecentPayments(limit);
+    if (payments.length === 0) {
+      await ctx.reply('📭 Нет платежей.');
+      return;
+    }
+
+    const formatPay = (p: typeof payments[number], idx: number): string => {
+      const lines: string[] = [];
+      const nameParts: string[] = [];
+      if (p.firstName) nameParts.push(p.firstName);
+      if (p.lastName) nameParts.push(p.lastName);
+      const fullName = nameParts.length > 0 ? nameParts.join(' ') : '—';
+      const paidAt = p.paidAt ? formatDateTimeRu(p.paidAt) : '—';
+      const createdAt = formatDateTimeRu(p.createdAt);
+      const validationStatus = p.validationStatus || '—';
+      const validationAt = p.validationConfirmedAt ? formatDateTimeRu(p.validationConfirmedAt) : '—';
+
+      lines.push(`<b>${idx}.</b>`);
+      lines.push(`👤 ${fullName}`);
+      if (p.username) lines.push(`📱 @${p.username}`);
+      lines.push(`🆔 <code>${p.telegramUserId}</code>`);
+      lines.push(`📦 ${p.planCode}`);
+      lines.push(`💰 ${(p.amount / 100).toFixed(0)}₴`);
+      lines.push(`🧾 Статус: ${p.status}`);
+      lines.push(`🕒 Создан: ${createdAt}`);
+      lines.push(`✅ Оплачен: ${paidAt}`);
+      lines.push(`🔎 Валидация: ${validationStatus} (${validationAt})`);
+      return lines.join('\n');
+    };
+
+    await ctx.reply(`📈 <b>Последние платежи: ${payments.length}</b>`, { parse_mode: 'HTML' });
+    const chunkSize = 5;
+    for (let i = 0; i < payments.length; i += chunkSize) {
+      const chunk = payments.slice(i, i + chunkSize);
+      const text = chunk.map((p, idx) => formatPay(p, i + idx + 1)).join('\n\n────────────────\n\n');
+      await ctx.reply(text, { parse_mode: 'HTML' });
+      if (i + chunkSize < payments.length) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+    }
+  });
+
   // Admin-only: grant test subscription for N days
   // Usage: /grantsub USER_ID DAYS
   bot.command('grantsub', async (ctx) => {
@@ -796,7 +919,9 @@ export function createBot(): Telegraf<BotContext> {
         'Купленный тариф',
         'Последняя оплата (грн)',
         'Дата оплаты',
-        'Всего оплачено (грн)'
+        'Всего оплачено (грн)',
+        'Статус валидации',
+        'Дата валидации'
       ].join(';'));
 
       // Данные
@@ -812,7 +937,9 @@ export function createBot(): Telegraf<BotContext> {
           u.purchasedPlanCode ? (planNames[u.purchasedPlanCode] || u.purchasedPlanCode) : '',
           u.lastPaymentAmount ? (u.lastPaymentAmount / 100).toFixed(0) : '',
           formatDate(u.lastPaymentAt),
-          u.totalPaid ? (u.totalPaid / 100).toFixed(0) : '0'
+          u.totalPaid ? (u.totalPaid / 100).toFixed(0) : '0',
+          u.lastPaymentValidationStatus || '',
+          formatDate(u.lastPaymentValidationAt)
         ].join(';'));
       }
 
@@ -851,6 +978,8 @@ export function createBot(): Telegraf<BotContext> {
       '/grantsub ID ДНИ — <i>выдать подписку</i>',
       '/revokesub ID — <i>забрать подписку</i>',
       '/export — <i>скачать CSV всех пользователей</i>',
+      '/payments [N] — <i>последние платежи и валидация</i>',
+      '/checkpayments — <i>принудительная проверка оплат</i>',
       '',
       '━━━━ <b>📤 Рассылка</b> ━━━━',
       '',
@@ -863,6 +992,30 @@ export function createBot(): Telegraf<BotContext> {
     ].join('\n');
     
     await ctx.reply(help, { parse_mode: 'HTML' });
+  });
+
+  // Admin-only: force payments check (button)
+  bot.command('checkpayments', async (ctx) => {
+    if (!isAdmin(ctx.from?.id)) return;
+    const kb = Markup.inlineKeyboard([
+      [Markup.button.callback('🔄 Проверить оплаты сейчас', 'admin:checkpayments')],
+    ]);
+    await ctx.reply('Нажмите кнопку для принудительной проверки оплат и валидации:', { reply_markup: kb.reply_markup });
+  });
+
+  bot.action('admin:checkpayments', async (ctx) => {
+    if (!isAdmin(ctx.from?.id)) return;
+    await ctx.editMessageText('⏳ Проверяю оплаты и валидацию...');
+    const result = await runPaymentsCheck(ctx.telegram);
+    const text = [
+      '✅ Проверка завершена',
+      `Успешных оплат: ${result.success}`,
+      `Ошибочных/истёкших: ${result.failed}`,
+      `Ожидают подтверждения: ${result.pendingConfirm}`,
+      `Подтверждено: ${result.confirmed}`,
+      `Не подтверждено: ${result.validationFailed}`,
+    ].join('\n');
+    await ctx.reply(text);
   });
 
   // Admin-only: diagnostics (bot permissions + subscriptions counters)
@@ -992,6 +1145,7 @@ export function createBot(): Telegraf<BotContext> {
       if (!update) return;
 
       const chatId = update.chat.id.toString();
+      if (chatId !== config.telegramChannelId) return;
       const userId = update.new_chat_member.user.id;
       const newStatus = update.new_chat_member.status;
       const oldStatus = update.old_chat_member.status;
@@ -1007,9 +1161,19 @@ export function createBot(): Telegraf<BotContext> {
 
       console.log(`[ChatMember] Пользователь ${userId} вступил в канал ${chatId}`);
 
-      // Проверяем подписку
       const nowSec = Math.floor(Date.now() / 1000);
-      const hasAccess = hasActiveSubscription(userId, chatId, nowSec) && hasSuccessfulPayment(userId);
+      recordUserChannelJoin(userId, chatId, nowSec);
+      const pendingValidation = getPendingPaymentValidationForUser(userId, nowSec);
+      if (pendingValidation) {
+        const updated = markPaymentValidationConfirmed(pendingValidation.invoiceId, nowSec, nowSec);
+        if (updated) {
+          const months = PLAN_DETAILS[pendingValidation.planCode].months;
+          createOrExtendSubscription(userId, chatId, pendingValidation.planCode, months, nowSec);
+        }
+      }
+
+      // Проверяем подписку
+      const hasAccess = hasActiveSubscription(userId, chatId, nowSec) && hasValidatedPayment(userId);
 
       if (!hasAccess) {
         console.log(`[ChatMember] У пользователя ${userId} нет активной подписки — удаляем`);
