@@ -5,18 +5,13 @@ import { Telegram, Markup } from 'telegraf';
 import { removeUserFromChannel, generateInviteLink } from './bot.js';
 import { PLAN_DETAILS, type PlanCode } from './types.js';
 import { fetchInvoiceStatus } from './monopay.js';
+import { CRON_TIMEZONE, EXPIRY_NOTICE_KEY, PAYMENT_VALIDATION_TIMEOUT_SEC, INVITE_LINK_EXPIRE_SEC, ONE_DAY_SEC, BROADCAST_DELAY_MS, SCHEDULER_ANTIFLOOD_DELAY_MS } from './constants.js';
 
 // Клавиатура тарифов для сообщений об истечении
 const tariffsKeyboard = Markup.inlineKeyboard([
   [Markup.button.callback('Подписка 1 месяц — 700₴', 'buy:P1M')],
   [Markup.button.callback('Подписка 2 месяца — 1200₴', 'buy:P2M')],
 ]);
-
-// Часовой пояс для cron (Киев)
-const CRON_TIMEZONE = 'Europe/Kiev';
-
-// daysBeforeExpiry=0 используем как "уведомление об истечении уже отправляли"
-const EXPIRY_NOTICE_KEY = 0;
 
 // Форматирование даты
 function formatDateRu(timestamp: number): string {
@@ -34,7 +29,7 @@ let validationsCheckInProgress = false;
 async function isUserInChannel(telegram: Telegram, chatId: string, userId: number): Promise<boolean> {
   try {
     const member = await telegram.getChatMember(chatId, userId);
-    const status = (member as any)?.status as string | undefined;
+    const status = (member as { status?: string })?.status;
     return (
       status === 'member' ||
       status === 'restricted' ||
@@ -71,7 +66,7 @@ async function handleSuccessfulPayment(
     return 'confirmed';
   }
 
-  const deadlineAt = paidAt + 10 * 60;
+  const deadlineAt = paidAt + PAYMENT_VALIDATION_TIMEOUT_SEC;
   createPaymentValidation({
     invoiceId,
     telegramUserId,
@@ -89,8 +84,8 @@ async function handleSuccessfulPayment(
       ? `✅ Оплата получена. В течение 10 минут перейдите по ссылке, чтобы подтвердить оплату:\n\n${link}`
       : '✅ Оплата получена. Перейдите в бота и получите ссылку на канал. На подтверждение есть 10 минут.';
     await telegram.sendMessage(telegramUserId, text);
-  } catch {
-    // ignore
+  } catch (err) {
+    console.error('[Scheduler] Ошибка отправки уведомления об оплате:', err);
   }
 
   return 'pending';
@@ -147,14 +142,14 @@ async function processExpiredSubscriptions(telegram: Telegram, reason: string): 
           '',
           'Выберите тариф для продления:'
         ].join('\n');
-        await telegram.sendMessage(sub.telegramUserId, message, {
+          await telegram.sendMessage(sub.telegramUserId, message, {
           parse_mode: 'HTML',
           reply_markup: tariffsKeyboard.reply_markup,
         });
         markExpiryReminderSent(sub.id, EXPIRY_NOTICE_KEY);
-        console.log(`[Scheduler] Уведомление отправлено: ${sub.telegramUserId}`);
+        console.log(`[Scheduler] Уведомление об истечении отправлено: ${sub.telegramUserId}`);
       } catch (err) {
-        console.error(`[Scheduler] Ошибка отправки уведомления userId=${sub.telegramUserId}:`, err);
+        console.error(`[Scheduler] Ошибка отправки уведомления об истечении userId=${sub.telegramUserId}:`, err);
       }
     }
 
@@ -280,7 +275,7 @@ export function startScheduler(telegram: Telegram): void {
           await telegram.sendMessage(sub.telegramUserId, message, { parse_mode: 'HTML' });
           markExpiryReminderSent(sub.id, 3);
           sent++;
-          await new Promise(resolve => setTimeout(resolve, 100));
+          await new Promise(resolve => setTimeout(resolve, BROADCAST_DELAY_MS));
         } catch (err) {
           console.error(`[Scheduler] Ошибка напоминания за 3 дня userId=${sub.telegramUserId}:`, err);
         }
@@ -315,7 +310,7 @@ export function startScheduler(telegram: Telegram): void {
           await telegram.sendMessage(sub.telegramUserId, message, { parse_mode: 'HTML' });
           markExpiryReminderSent(sub.id, 1);
           sent++;
-          await new Promise(resolve => setTimeout(resolve, 100));
+          await new Promise(resolve => setTimeout(resolve, BROADCAST_DELAY_MS));
         } catch (err) {
           console.error(`[Scheduler] Ошибка напоминания за 1 день userId=${sub.telegramUserId}:`, err);
         }
@@ -357,7 +352,7 @@ export function startScheduler(telegram: Telegram): void {
         checked++;
         try {
           const member = await telegram.getChatMember(config.telegramChannelId, uid);
-          const status = (member as any)?.status as string | undefined;
+          const status = (member as { status?: string })?.status;
           const isIn =
             status === 'member' ||
             status === 'restricted' ||
@@ -377,7 +372,7 @@ export function startScheduler(telegram: Telegram): void {
         }
 
         // антифлуд
-        await new Promise(resolve => setTimeout(resolve, 120));
+        await new Promise(resolve => setTimeout(resolve, SCHEDULER_ANTIFLOOD_DELAY_MS));
       }
 
       console.log(`[Scheduler] Аудит неоплативших завершён (${reason}): checked=${checked}, kicked=${kicked}`);
@@ -404,7 +399,7 @@ export function startScheduler(telegram: Telegram): void {
       if (active) continue;
       const info = getReminderInfo(uid);
       if (info.sendCount >= 3) continue;
-      if (info.lastSentAt && nowSec - info.lastSentAt < 24 * 60 * 60) continue; // remind at most once per day
+      if (info.lastSentAt && nowSec - info.lastSentAt < ONE_DAY_SEC) continue; // remind at most once per day
       try {
         await telegram.sendMessage(uid, 'Ваша подписка отсутствует или истекла. Чтобы продолжить доступ к каналу, оформите подписку в боте.');
         setReminderSentNow(uid, nowSec);

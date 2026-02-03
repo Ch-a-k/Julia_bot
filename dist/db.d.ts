@@ -19,6 +19,25 @@ export type Payment = {
     createdAt: number;
     paidAt?: number | null;
 };
+export type PaymentValidation = {
+    invoiceId: string;
+    telegramUserId: number;
+    planCode: PlanCode;
+    paidAt: number;
+    deadlineAt: number;
+    status: 'pending' | 'confirmed' | 'failed';
+    confirmedAt?: number | null;
+    joinAt?: number | null;
+};
+export type PaymentWithUser = Payment & {
+    username?: string | null;
+    firstName?: string | null;
+    lastName?: string | null;
+    validationStatus?: string | null;
+    validationConfirmedAt?: number | null;
+    validationJoinAt?: number | null;
+    validationDeadlineAt?: number | null;
+};
 export type UserInfo = {
     telegramUserId: number;
     username?: string | null;
@@ -32,14 +51,19 @@ export declare function getDb(): Database.Database;
 export declare function closeDb(): void;
 export declare function insertPayment(p: Omit<Payment, 'id'>): void;
 export declare function hasSuccessfulPayment(telegramUserId: number): boolean;
+export declare function hasValidatedPayment(telegramUserId: number): boolean;
 export declare function listUserIdsWithoutSuccessfulPayment(): number[];
+export declare function listUserIdsWithoutValidatedPayment(): number[];
 export declare function updatePaymentStatus(invoiceId: string, status: string, paidAt?: number): void;
 export declare function createOrExtendSubscription(telegramUserId: number, chatId: string, planCode: PlanCode, months: number, nowSec: number): Subscription;
 export declare function findExpiredActiveSubscriptions(nowSec: number): Subscription[];
 export declare function deactivateSubscription(id: number): void;
 export declare function hasActiveSubscription(telegramUserId: number, chatId: string, nowSec: number): boolean;
 export declare function listKnownUserIds(): number[];
-export declare function getLastReminderAt(telegramUserId: number): number | null;
+export declare function getReminderInfo(telegramUserId: number): {
+    lastSentAt: number | null;
+    sendCount: number;
+};
 export declare function setReminderSentNow(telegramUserId: number, nowSec: number): void;
 export declare function getSetting(key: string): string | null;
 export declare function setSetting(key: string, value: string): void;
@@ -49,6 +73,14 @@ export declare function getLastPendingPayment(telegramUserId: number): {
 } | null;
 export declare function markPaymentStatus(invoiceId: string, status: string, paidAt?: number): void;
 export declare function tryMarkPaymentSuccess(invoiceId: string, paidAt: number): boolean;
+export declare function createPaymentValidation(p: PaymentValidation): void;
+export declare function getPendingPaymentValidationForUser(telegramUserId: number, nowSec: number): PaymentValidation | null;
+export declare function listPendingPaymentValidations(): PaymentValidation[];
+export declare function markPaymentValidationConfirmed(invoiceId: string, joinAt: number, confirmedAt: number): boolean;
+export declare function markPaymentValidationFailed(invoiceId: string, failedAt: number): boolean;
+export declare function recordUserChannelJoin(telegramUserId: number, chatId: string, joinAt: number): void;
+export declare function getLastUserChannelJoin(telegramUserId: number, chatId: string): number | null;
+export declare function getRecentPayments(limit: number): PaymentWithUser[];
 export declare function getAllActiveSubscriptions(): Subscription[];
 export declare function createSubscriptionForDays(telegramUserId: number, chatId: string, days: number): Subscription;
 export declare function getUserSubscription(telegramUserId: number, chatId: string): Subscription | null;
@@ -95,6 +127,8 @@ export type UserExportData = {
     totalPaid: number;
     lastPaymentAt: number | null;
     lastPaymentAmount: number | null;
+    lastPaymentValidationStatus: string | null;
+    lastPaymentValidationAt: number | null;
 };
 export declare function getAllUsersForExport(): UserExportData[];
 //# sourceMappingURL=db.d.ts.map

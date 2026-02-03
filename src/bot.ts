@@ -1,9 +1,11 @@
 import { Telegraf, Markup, Context, Telegram } from 'telegraf';
 import { config, isAdmin } from './config.js';
-import { PLAN_DETAILS, type PlanCode } from './types.js';
+import { PLAN_DETAILS, type PlanCode, type TelegramChatMember, type TelegramChatInviteLink, type TelegramMessage } from './types.js';
 import { createInvoice, fetchInvoiceStatus } from './monopay.js';
 import { insertPayment, hasActiveSubscription, getLastPendingPayment, createOrExtendSubscription, getSetting, setSetting, createSubscriptionForDays, getUserSubscription, saveUserInfo, getExtendedActiveSubscriptions, findUsersByQuery, getActiveSubscribersIds, getUserInfo, getAllUsersForExport, tryMarkPaymentSuccess, hasSuccessfulPayment, type ExtendedSubscriptionInfo, hasValidatedPayment, createPaymentValidation, getPendingPaymentValidationForUser, markPaymentValidationConfirmed, recordUserChannelJoin, getRecentPayments } from './db.js';
 import { runExpiredSubscriptionsCheck, getExpiredSubscriptionsInfo, runPaymentsCheck } from './scheduler.js';
+import { PAYMENT_VALIDATION_TIMEOUT_SEC, INVITE_LINK_EXPIRE_SEC, BROADCAST_DELAY_MS } from './constants.js';
+import { getRecentLogs, getRecentErrors, subscribeToLogs, unsubscribeFromLogs, isSubscribed, getLogStats } from './logger.js';
 
 // Форматирование даты на русском
 function formatDateRu(timestamp: number): string {
@@ -40,18 +42,19 @@ export type BotContext = Context & {
 export async function generateInviteLink(telegram: Telegram, userId: number): Promise<string | undefined> {
   const nowSec = Math.floor(Date.now() / 1000);
   try {
-    const expireIn = 24 * 60 * 60;
     const invite = await telegram.createChatInviteLink(config.telegramChannelId, {
-      expire_date: nowSec + expireIn,
+      expire_date: nowSec + INVITE_LINK_EXPIRE_SEC,
       member_limit: 1,
       creates_join_request: false,
       name: `access-${userId}-${Date.now()}`,
-    } as any);
-    return (invite as any).invite_link || (invite as any).inviteLink;
-  } catch {
+    }) as TelegramChatInviteLink;
+    return invite.invite_link || invite.inviteLink;
+  } catch (err) {
+    console.error('[InviteLink] Ошибка создания персональной ссылки:', err);
     try {
       return await telegram.exportChatInviteLink(config.telegramChannelId);
-    } catch {
+    } catch (err2) {
+      console.error('[InviteLink] Ошибка экспорта общей ссылки:', err2);
       return undefined;
     }
   }
@@ -62,9 +65,8 @@ export function createBot(): Telegraf<BotContext> {
 
   async function isUserSubscribed(userId: number): Promise<boolean> {
     try {
-      const member = await bot.telegram.getChatMember(config.telegramChannelId, userId);
-      const status = (member as any).status as string;
-      return status !== 'left' && status !== 'kicked';
+      const member = await bot.telegram.getChatMember(config.telegramChannelId, userId) as TelegramChatMember;
+      return member.status !== 'left' && member.status !== 'kicked';
     } catch {
       return false;
     }
@@ -147,13 +149,14 @@ export function createBot(): Telegraf<BotContext> {
   bot.action('menu:info', async (ctx) => {
     const attributionSpoiler = config.creatorLink ? `\n\n<tg-spoiler>Создано: ${config.creatorLink}</tg-spoiler>` : '';
     const text = `${welcomeText}${attributionSpoiler}`;
-    await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: mainMenuInline().reply_markup } as any);
+    await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: mainMenuInline().reply_markup });
   });
 
   bot.action('menu:subscribe', async (ctx) => {
     const text = 'Выберите тариф подписки:';
-    const isPhoto = (ctx.callbackQuery as any)?.message?.photo;
-    const opts = { reply_markup: tariffsKeyboard.reply_markup } as any;
+    const message = (ctx.callbackQuery as { message?: TelegramMessage })?.message;
+    const isPhoto = Array.isArray(message?.photo) && message.photo.length > 0;
+    const opts = { reply_markup: tariffsKeyboard.reply_markup };
     if (isPhoto) {
       await ctx.editMessageCaption(text, opts);
     } else {
@@ -173,15 +176,17 @@ export function createBot(): Telegraf<BotContext> {
         [Markup.button.callback('◀︎ Назад в меню', 'menu:info')],
       ].filter(r => r.length > 0));
       const text = link ? 'Админ-доступ: нажмите, чтобы перейти в канал.' : 'Не удалось создать ссылку. Проверьте права бота.';
-      const isPhoto = (ctx.callbackQuery as any)?.message?.photo;
-      const opts = { reply_markup: kb.reply_markup } as any;
+      const message = (ctx.callbackQuery as { message?: TelegramMessage })?.message;
+      const isPhoto = Array.isArray(message?.photo) && message.photo.length > 0;
+      const opts = { reply_markup: kb.reply_markup };
       if (isPhoto) await ctx.editMessageCaption(text, opts); else await ctx.editMessageText(text, opts);
       return;
     }
     // Доступ даём только при активной подписке + наличии успешной оплаты.
     // Это закрывает кейс "в subscriptions есть запись (например, тест/ручная), но в payments нет".
     const active = hasActiveSubscription(user.id, config.telegramChannelId, nowSec) && hasValidatedPayment(user.id);
-    const isPhoto = (ctx.callbackQuery as any)?.message?.photo;
+    const message = (ctx.callbackQuery as { message?: TelegramMessage })?.message;
+    const isPhoto = Array.isArray(message?.photo) && message.photo.length > 0;
     if (active) {
       const link = await generateInviteLinkFor(user.id);
       const kb = Markup.inlineKeyboard([
@@ -189,7 +194,7 @@ export function createBot(): Telegraf<BotContext> {
         [Markup.button.callback('◀︎ Назад в меню', 'menu:info')],
       ].filter(r => r.length > 0));
       const text = link ? 'У вас активная подписка. Нажмите, чтобы перейти в канал.' : 'У вас активная подписка, но не удалось создать ссылку. Свяжитесь с поддержкой.';
-      const opts = { reply_markup: kb.reply_markup } as any;
+      const opts = { reply_markup: kb.reply_markup };
       if (isPhoto) await ctx.editMessageCaption(text, opts); else await ctx.editMessageText(text, opts);
     } else {
       const pendingValidation = getPendingPaymentValidationForUser(user.id, nowSec);
@@ -207,7 +212,7 @@ export function createBot(): Telegraf<BotContext> {
             [Markup.button.callback('◀︎ Назад в меню', 'menu:info')],
           ].filter(r => r.length > 0));
           const text = link ? 'Оплата подтверждена. Нажмите, чтобы перейти в канал.' : 'Оплата подтверждена, но не удалось создать ссылку. Свяжитесь с поддержкой.';
-          const opts = { reply_markup: kb.reply_markup } as any;
+          const opts = { reply_markup: kb.reply_markup };
           if (isPhoto) await ctx.editMessageCaption(text, opts); else await ctx.editMessageText(text, opts);
           return;
         }
@@ -220,7 +225,7 @@ export function createBot(): Telegraf<BotContext> {
         const text = link
           ? 'Оплата в обработке. Перейдите по ссылке в течение 10 минут для подтверждения.'
           : 'Оплата в обработке. Перейдите в бота и получите ссылку. На подтверждение есть 10 минут.';
-        const opts = { reply_markup: kb.reply_markup } as any;
+        const opts = { reply_markup: kb.reply_markup };
         if (isPhoto) await ctx.editMessageCaption(text, opts); else await ctx.editMessageText(text, opts);
         return;
       }
@@ -253,7 +258,7 @@ export function createBot(): Telegraf<BotContext> {
                   telegramUserId: user.id,
                   planCode: pending.planCode,
                   paidAt: nowSec,
-                  deadlineAt: nowSec + 10 * 60,
+                  deadlineAt: nowSec + PAYMENT_VALIDATION_TIMEOUT_SEC,
                   status: 'pending',
                   confirmedAt: null,
                   joinAt: null,
@@ -266,7 +271,7 @@ export function createBot(): Telegraf<BotContext> {
                 telegramUserId: user.id,
                 planCode: pending.planCode,
                 paidAt: nowSec,
-                deadlineAt: isInChannel ? nowSec : nowSec + 10 * 60,
+                deadlineAt: isInChannel ? nowSec : nowSec + PAYMENT_VALIDATION_TIMEOUT_SEC,
                 status: isInChannel ? 'confirmed' : 'pending',
                 confirmedAt: isInChannel ? nowSec : null,
                 joinAt: isInChannel ? nowSec : null,
@@ -280,18 +285,20 @@ export function createBot(): Telegraf<BotContext> {
             const text = link
               ? 'Оплата найдена. Нажмите, чтобы перейти в канал (на подтверждение есть 10 минут).'
               : 'Оплата найдена, но не удалось создать ссылку. Свяжитесь с поддержкой.';
-            const opts = { reply_markup: kb.reply_markup } as any;
+            const opts = { reply_markup: kb.reply_markup };
             if (isPhoto) await ctx.editMessageCaption(text, opts); else await ctx.editMessageText(text, opts);
             return;
           }
-        } catch {}
+        } catch (err) {
+          console.error('[CheckAccess] Ошибка проверки статуса pending платежа:', err);
+        }
       }
       const kb = Markup.inlineKeyboard([
         [Markup.button.callback('Оформить подписку', 'menu:subscribe')],
         [Markup.button.callback('◀︎ Назад в меню', 'menu:info')],
       ]);
       const text = 'Доступ отсутствует. Оформите подписку.';
-      const opts = { reply_markup: kb.reply_markup } as any;
+      const opts = { reply_markup: kb.reply_markup };
       if (isPhoto) await ctx.editMessageCaption(text, opts); else await ctx.editMessageText(text, opts);
     }
   });
@@ -307,7 +314,7 @@ export function createBot(): Telegraf<BotContext> {
     if (!photos || photos.length === 0) return;
     const best = photos[photos.length - 1];
     if (!best) return;
-    const fileId = (best as any).file_id as string | undefined;
+    const fileId = best.file_id;
     if (!fileId) return;
 
     if (isAdmin(ctx.from?.id)) {
@@ -331,7 +338,8 @@ export function createBot(): Telegraf<BotContext> {
     try {
       const link = await generateInviteLinkFor(ctx.from!.id);
       await ctx.reply(link ? `Ссылка: ${link}` : 'Не удалось создать ссылку.');
-    } catch {
+    } catch (err) {
+      console.error('[InviteLink] Ошибка команды invitelink:', err);
       await ctx.reply('Ошибка создания ссылки.');
     }
   });
@@ -493,7 +501,7 @@ export function createBot(): Telegraf<BotContext> {
 
         await ctx.telegram.sendMessage(userId, personalizedMessage, { parse_mode: 'HTML' });
         sent++;
-        await new Promise(resolve => setTimeout(resolve, 100));
+        await new Promise(resolve => setTimeout(resolve, BROADCAST_DELAY_MS));
       } catch (err) {
         failed++;
         const userInfo = getUserInfo(userId);
@@ -703,7 +711,7 @@ export function createBot(): Telegraf<BotContext> {
       await ctx.reply(text, { parse_mode: 'HTML' });
       // Небольшая задержка между сообщениями
       if (i + chunkSize < subscriptions.length) {
-        await new Promise(resolve => setTimeout(resolve, 100));
+        await new Promise(resolve => setTimeout(resolve, BROADCAST_DELAY_MS));
       }
     }
   });
@@ -751,7 +759,7 @@ export function createBot(): Telegraf<BotContext> {
       const text = chunk.map((p, idx) => formatPay(p, i + idx + 1)).join('\n\n────────────────\n\n');
       await ctx.reply(text, { parse_mode: 'HTML' });
       if (i + chunkSize < payments.length) {
-        await new Promise(resolve => setTimeout(resolve, 100));
+        await new Promise(resolve => setTimeout(resolve, BROADCAST_DELAY_MS));
       }
     }
   });
@@ -801,9 +809,9 @@ export function createBot(): Telegraf<BotContext> {
             paidAt: nowSec,
           });
         }
-      } catch (e) {
+      } catch (err) {
         // не делаем фатальным — подписка уже создана
-        console.warn('[GrantSub] Не удалось записать "подарочную" оплату:', e);
+        console.warn('[GrantSub] Не удалось записать "подарочную" оплату:', err);
       }
       
       await ctx.reply(
@@ -821,7 +829,8 @@ export function createBot(): Telegraf<BotContext> {
           : `🎁 Вам предоставлен доступ к каналу на ${days} дн.! Перейдите в бота, чтобы получить ссылку.`;
         await ctx.telegram.sendMessage(userId, userMessage);
         await ctx.reply('📨 Пользователь уведомлён.');
-      } catch {
+      } catch (err) {
+        console.error('[GrantSub] Ошибка уведомления пользователя:', err);
         await ctx.reply('⚠️ Не удалось уведомить пользователя (возможно, он не начинал диалог с ботом).');
       }
     } catch (err) {
@@ -864,15 +873,16 @@ export function createBot(): Telegraf<BotContext> {
       try {
         await removeUserFromChannel(ctx.telegram, config.telegramChannelId, userId);
         await ctx.reply(`✅ Подписка пользователя ${userId} отозвана, доступ к каналу закрыт.`);
-      } catch {
+      } catch (err) {
+        console.error('[RevokeSub] Ошибка удаления из канала:', err);
         await ctx.reply(`✅ Подписка отозвана, но не удалось удалить из канала (возможно, уже не в канале).`);
       }
 
       // Уведомляем пользователя
       try {
         await ctx.telegram.sendMessage(userId, 'Ваша подписка была отозвана. Доступ к каналу закрыт.');
-      } catch {
-        // Пользователь мог заблокировать бота
+      } catch (err) {
+        console.error('[RevokeSub] Ошибка уведомления пользователя:', err);
       }
     } catch (err) {
       await ctx.reply(`❌ Ошибка: ${err}`);
@@ -985,6 +995,14 @@ export function createBot(): Telegraf<BotContext> {
       '',
       '/broadcast — <i>рассылка с предпросмотром</i>',
       '',
+      '━━━━ <b>📊 Логи и мониторинг</b> ━━━━',
+      '',
+      '/logs [N] — <i>последние N логов (по умолчанию 50)</i>',
+      '/errors [N] — <i>последние N ошибок (по умолчанию 20)</i>',
+      '/logstream — <i>подписаться на логи в реальном времени</i>',
+      '/stopstream — <i>отписаться от логов</i>',
+      '/logstats — <i>статистика логов</i>',
+      '',
       '━━━━ <b>⚙️ Прочее</b> ━━━━',
       '',
       '/invitelink — <i>Одноразовая ссылка на канал</i>',
@@ -993,6 +1011,110 @@ export function createBot(): Telegraf<BotContext> {
     ].join('\n');
     
     await ctx.reply(help, { parse_mode: 'HTML' });
+  });
+
+  // Admin-only: получить последние логи
+  bot.command('logs', async (ctx) => {
+    if (!isAdmin(ctx.from?.id)) return;
+    
+    const args = ctx.message.text.split(' ').slice(1);
+    const count = Math.min(Math.max(parseInt(args[0] || '50', 10) || 50, 1), 100);
+    
+    try {
+      const logs = getRecentLogs(count);
+      
+      // Разбиваем на части если слишком длинное
+      const maxLength = 4000;
+      if (logs.length <= maxLength) {
+        await ctx.reply(`📋 <b>Последние ${count} логов:</b>\n\n<code>${logs}</code>`, { parse_mode: 'HTML' });
+      } else {
+        // Отправляем по частям
+        const chunks = logs.match(new RegExp(`.{1,${maxLength}}`, 'g')) || [];
+        await ctx.reply(`📋 <b>Последние ${count} логов (часть 1/${chunks.length}):</b>`, { parse_mode: 'HTML' });
+        for (let i = 0; i < chunks.length; i++) {
+          await ctx.reply(`<code>${chunks[i]}</code>`, { parse_mode: 'HTML' });
+          if (i < chunks.length - 1) {
+            await new Promise(resolve => setTimeout(resolve, 300));
+          }
+        }
+      }
+    } catch (err) {
+      await ctx.reply(`❌ Ошибка получения логов: ${err}`);
+    }
+  });
+
+  // Admin-only: получить только ошибки
+  bot.command('errors', async (ctx) => {
+    if (!isAdmin(ctx.from?.id)) return;
+    
+    const args = ctx.message.text.split(' ').slice(1);
+    const count = Math.min(Math.max(parseInt(args[0] || '20', 10) || 20, 1), 50);
+    
+    try {
+      const errors = getRecentErrors(count);
+      await ctx.reply(`🔴 <b>Последние ${count} ошибок:</b>\n\n<code>${errors}</code>`, { parse_mode: 'HTML' });
+    } catch (err) {
+      await ctx.reply(`❌ Ошибка получения ошибок: ${err}`);
+    }
+  });
+
+  // Admin-only: подписаться на логи в реальном времени
+  bot.command('logstream', async (ctx) => {
+    if (!isAdmin(ctx.from?.id)) return;
+    
+    const userId = ctx.from.id;
+    
+    if (isSubscribed(userId)) {
+      await ctx.reply('ℹ️ Вы уже подписаны на логи в реальном времени.\n\nДля отписки используйте /stopstream');
+      return;
+    }
+    
+    subscribeToLogs(userId);
+    await ctx.reply(
+      '✅ <b>Подписка на логи активирована!</b>\n\n' +
+      'Теперь <b>только вы</b> будете получать все логи бота в реальном времени:\n' +
+      '📝 INFO — обычные сообщения\n' +
+      '⚠️ WARN — предупреждения\n' +
+      '🔴 ERROR — ошибки\n\n' +
+      '💡 <i>Каждый админ может подписаться независимо</i>\n\n' +
+      'Для отключения используйте /stopstream',
+      { parse_mode: 'HTML' }
+    );
+  });
+
+  // Admin-only: отписаться от логов
+  bot.command('stopstream', async (ctx) => {
+    if (!isAdmin(ctx.from?.id)) return;
+    
+    const userId = ctx.from.id;
+    
+    if (!isSubscribed(userId)) {
+      await ctx.reply('ℹ️ Вы не подписаны на логи.');
+      return;
+    }
+    
+    unsubscribeFromLogs(userId);
+    await ctx.reply('✅ Подписка на логи отключена.');
+  });
+
+  // Admin-only: статистика логов
+  bot.command('logstats', async (ctx) => {
+    if (!isAdmin(ctx.from?.id)) return;
+    
+    const stats = getLogStats();
+    
+    const text = [
+      '📊 <b>Статистика логов</b>',
+      '',
+      `📝 Всего записей в буфере: <b>${stats.total}</b>`,
+      `🔴 Ошибок: <b>${stats.errors}</b>`,
+      `⚠️ Предупреждений: <b>${stats.warnings}</b>`,
+      `👥 Подписчиков на stream: <b>${stats.subscribers}</b>`,
+      '',
+      '<i>Буфер хранит последние 500 записей</i>',
+    ].join('\n');
+    
+    await ctx.reply(text, { parse_mode: 'HTML' });
   });
 
   // Admin-only: force payments check (button)
@@ -1028,10 +1150,10 @@ export function createBot(): Telegraf<BotContext> {
       const now = new Date();
       const nowSec = Math.floor(now.getTime() / 1000);
 
-      const myMember = await ctx.telegram.getChatMember(config.telegramChannelId, botId);
-      const status = (myMember as any).status;
-      const canRestrict = (myMember as any).can_restrict_members ?? (myMember as any).canRestrictMembers;
-      const canInvite = (myMember as any).can_invite_users ?? (myMember as any).canInviteUsers;
+      const myMember = await ctx.telegram.getChatMember(config.telegramChannelId, botId) as TelegramChatMember;
+      const status = myMember.status;
+      const canRestrict = myMember.can_restrict_members ?? myMember.canRestrictMembers;
+      const canInvite = myMember.can_invite_users ?? myMember.canInviteUsers;
 
       const { findExpiredActiveSubscriptions, findExpiringSubscriptions } = await import('./db.js');
       const expired = findExpiredActiveSubscriptions(nowSec);
@@ -1087,20 +1209,21 @@ export function createBot(): Telegraf<BotContext> {
       const months = PLAN_DETAILS[plan].months;
       // generate invite link immediately without payment
       try {
-        const expireIn = 24 * 60 * 60;
         const invite = await ctx.telegram.createChatInviteLink(config.telegramChannelId, {
-          expire_date: nowSec + expireIn,
+          expire_date: nowSec + INVITE_LINK_EXPIRE_SEC,
           member_limit: 1,
           creates_join_request: false,
           name: `test-${user.id}-${plan}-${Date.now()}`,
-        } as any);
-        const inviteLink = (invite as any).invite_link || (invite as any).inviteLink;
+        }) as TelegramChatInviteLink;
+        const inviteLink = invite.invite_link || invite.inviteLink;
         await ctx.reply(`ТЕСТОВЫЙ РЕЖИМ: доступ на ${months} мес. Ваша ссылка: ${inviteLink}`);
-      } catch {
+      } catch (err) {
+        console.error('[TestMode] Ошибка создания персональной ссылки:', err);
         try {
           const fallbackLink = await ctx.telegram.exportChatInviteLink(config.telegramChannelId);
           await ctx.reply(`ТЕСТОВЫЙ РЕЖИМ: доступ на ${months} мес. Ссылка: ${fallbackLink}`);
-        } catch {
+        } catch (err2) {
+          console.error('[TestMode] Ошибка экспорта общей ссылки:', err2);
           await ctx.reply('ТЕСТОВЫЙ РЕЖИМ: не удалось создать ссылку приглашения. Убедитесь, что бот — администратор канала с правом пригласить по ссылке, и что указан корректный TELEGRAM_CHANNEL_ID (например, -100... или @username).');
         }
       }
@@ -1129,11 +1252,13 @@ export function createBot(): Telegraf<BotContext> {
         [Markup.button.url('Перейти к оплате', invoice.pageUrl)],
         [Markup.button.callback('◀︎ Назад в меню', 'menu:info')],
       ]);
-      const isPhoto = (ctx.callbackQuery as any)?.message?.photo;
+      const message = (ctx.callbackQuery as { message?: TelegramMessage })?.message;
+      const isPhoto = Array.isArray(message?.photo) && message.photo.length > 0;
       const text = `${planTitle}. Нажмите, чтобы перейти к оплате.`;
-      const opts = { reply_markup: payBtn.reply_markup } as any;
+      const opts = { reply_markup: payBtn.reply_markup };
       if (isPhoto) await ctx.editMessageCaption(text, opts); else await ctx.editMessageText(text, opts);
-    } catch (e) {
+    } catch (err) {
+      console.error('[Buy] Ошибка создания счёта MonoPay:', err);
       await ctx.reply('Не удалось создать счёт. Попробуйте позже.');
     }
   });

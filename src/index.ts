@@ -3,6 +3,7 @@ import { startScheduler } from './scheduler.js';
 import { assertConfig, config } from './config.js';
 import { initDb } from './db.js';
 import { startServer } from './server.js';
+import { initLogger } from './logger.js';
 
 async function main(): Promise<void> {
   // eslint-disable-next-line no-console
@@ -33,6 +34,10 @@ async function main(): Promise<void> {
     });
   // eslint-disable-next-line no-console
   console.log('[Boot] Polling started');
+  
+  // Инициализируем систему логирования (после запуска бота)
+  initLogger(bot.telegram);
+  
   startScheduler(bot.telegram);
   // eslint-disable-next-line no-console
   console.log('[Boot] Scheduler started');

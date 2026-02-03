@@ -2,6 +2,7 @@ import Database from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';
 import { config } from './config.js';
+import { ONE_MONTH_APPROX_SEC, ONE_DAY_SEC } from './constants.js';
 let db;
 export function initDb() {
     const dir = path.dirname(config.databasePath);
@@ -29,6 +30,24 @@ export function initDb() {
       status TEXT NOT NULL,
       createdAt INTEGER NOT NULL,
       paidAt INTEGER
+    );
+
+    CREATE TABLE IF NOT EXISTS payment_validations (
+      invoiceId TEXT PRIMARY KEY,
+      telegramUserId INTEGER NOT NULL,
+      planCode TEXT NOT NULL,
+      paidAt INTEGER NOT NULL,
+      deadlineAt INTEGER NOT NULL,
+      status TEXT NOT NULL,
+      confirmedAt INTEGER,
+      joinAt INTEGER
+    );
+
+    CREATE TABLE IF NOT EXISTS user_channel_joins (
+      telegramUserId INTEGER NOT NULL,
+      chatId TEXT NOT NULL,
+      lastJoinAt INTEGER NOT NULL,
+      PRIMARY KEY (telegramUserId, chatId)
     );
 
     CREATE INDEX IF NOT EXISTS idx_subscriptions_user ON subscriptions(telegramUserId);
@@ -61,6 +80,13 @@ export function initDb() {
       PRIMARY KEY (subscriptionId, daysBeforeExpiry)
     );
   `);
+    // Мягкая миграция: добавляем счётчик напоминаний, если старый инстанс уже создан.
+    try {
+        db.exec(`ALTER TABLE reminders_non_subscribed ADD COLUMN sendCount INTEGER NOT NULL DEFAULT 0`);
+    }
+    catch {
+        // column already exists
+    }
 }
 export function getDb() {
     if (!db)
@@ -81,6 +107,20 @@ export function hasSuccessfulPayment(telegramUserId) {
     const row = getDb().prepare(`SELECT 1 FROM payments WHERE telegramUserId=? AND status='success' LIMIT 1`).get(telegramUserId);
     return !!row;
 }
+export function hasValidatedPayment(telegramUserId) {
+    const dbConn = getDb();
+    const confirmed = dbConn.prepare(`SELECT 1 FROM payment_validations WHERE telegramUserId=? AND status='confirmed' LIMIT 1`).get(telegramUserId);
+    if (confirmed)
+        return true;
+    const nowSec = Math.floor(Date.now() / 1000);
+    const pending = dbConn.prepare(`SELECT deadlineAt FROM payment_validations WHERE telegramUserId=? AND status='pending' ORDER BY paidAt DESC LIMIT 1`).get(telegramUserId);
+    if (pending && pending.deadlineAt >= nowSec)
+        return true;
+    const hasAnyValidation = dbConn.prepare(`SELECT 1 FROM payment_validations WHERE telegramUserId=? LIMIT 1`).get(telegramUserId);
+    if (hasAnyValidation)
+        return false;
+    return hasSuccessfulPayment(telegramUserId);
+}
 // Пользователи, по которым у нас есть хоть какие-то данные (старт/подписки/оплаты),
 // но при этом НЕТ ни одной успешной оплаты.
 export function listUserIdsWithoutSuccessfulPayment() {
@@ -98,6 +138,18 @@ export function listUserIdsWithoutSuccessfulPayment() {
   `).all();
     return rows.map(r => r.uid);
 }
+export function listUserIdsWithoutValidatedPayment() {
+    const rows = getDb().prepare(`
+    SELECT DISTINCT uid FROM (
+      SELECT telegramUserId AS uid FROM users
+      UNION
+      SELECT telegramUserId AS uid FROM subscriptions
+      UNION
+      SELECT telegramUserId AS uid FROM payments
+    ) all_ids
+  `).all();
+    return rows.map(r => r.uid).filter(uid => !hasValidatedPayment(uid));
+}
 export function updatePaymentStatus(invoiceId, status, paidAt) {
     getDb().prepare(`UPDATE payments SET status=@status, paidAt=@paidAt WHERE invoiceId=@invoiceId`).run({ invoiceId, status, paidAt: paidAt ?? null });
 }
@@ -106,7 +158,7 @@ export function createOrExtendSubscription(telegramUserId, chatId, planCode, mon
     const existing = dbConn
         .prepare(`SELECT * FROM subscriptions WHERE telegramUserId=? AND chatId=? AND active=1 LIMIT 1`)
         .get(telegramUserId, chatId);
-    const secondsToAdd = Math.floor(months * 30 * 24 * 60 * 60); // approx
+    const secondsToAdd = Math.floor(months * ONE_MONTH_APPROX_SEC);
     let startAt = nowSec;
     let endAt = nowSec + secondsToAdd;
     if (existing) {
@@ -137,14 +189,17 @@ export function listKnownUserIds() {
      SELECT DISTINCT telegramUserId AS uid FROM subscriptions`).all();
     return rows.map(r => r.uid);
 }
-export function getLastReminderAt(telegramUserId) {
-    const row = getDb().prepare(`SELECT lastSentAt as ts FROM reminders_non_subscribed WHERE telegramUserId=?`).get(telegramUserId);
-    return row ? row.ts : null;
+export function getReminderInfo(telegramUserId) {
+    const row = getDb().prepare(`SELECT lastSentAt as ts, sendCount as cnt FROM reminders_non_subscribed WHERE telegramUserId=?`).get(telegramUserId);
+    return {
+        lastSentAt: row?.ts ?? null,
+        sendCount: row?.cnt ?? 0,
+    };
 }
 export function setReminderSentNow(telegramUserId, nowSec) {
-    getDb().prepare(`INSERT INTO reminders_non_subscribed (telegramUserId, lastSentAt)
-     VALUES (@telegramUserId, @nowSec)
-     ON CONFLICT(telegramUserId) DO UPDATE SET lastSentAt=@nowSec`).run({ telegramUserId, nowSec });
+    getDb().prepare(`INSERT INTO reminders_non_subscribed (telegramUserId, lastSentAt, sendCount)
+     VALUES (@telegramUserId, @nowSec, 1)
+     ON CONFLICT(telegramUserId) DO UPDATE SET lastSentAt=@nowSec, sendCount=sendCount+1`).run({ telegramUserId, nowSec });
 }
 export function getSetting(key) {
     const row = getDb().prepare(`SELECT value FROM settings WHERE key=?`).get(key);
@@ -174,6 +229,87 @@ export function tryMarkPaymentSuccess(invoiceId, paidAt) {
      WHERE invoiceId=@invoiceId AND status IN ('created','processing','holded')`).run({ invoiceId, paidAt });
     return result.changes > 0;
 }
+export function createPaymentValidation(p) {
+    getDb().prepare(`
+    INSERT OR IGNORE INTO payment_validations
+    (invoiceId, telegramUserId, planCode, paidAt, deadlineAt, status, confirmedAt, joinAt)
+    VALUES (@invoiceId, @telegramUserId, @planCode, @paidAt, @deadlineAt, @status, @confirmedAt, @joinAt)
+  `).run({
+        invoiceId: p.invoiceId,
+        telegramUserId: p.telegramUserId,
+        planCode: p.planCode,
+        paidAt: p.paidAt,
+        deadlineAt: p.deadlineAt,
+        status: p.status,
+        confirmedAt: p.confirmedAt ?? null,
+        joinAt: p.joinAt ?? null,
+    });
+}
+export function getPendingPaymentValidationForUser(telegramUserId, nowSec) {
+    const row = getDb().prepare(`
+    SELECT * FROM payment_validations
+    WHERE telegramUserId=? AND status='pending' AND deadlineAt >= ?
+    ORDER BY paidAt DESC LIMIT 1
+  `).get(telegramUserId, nowSec);
+    return row ?? null;
+}
+export function listPendingPaymentValidations() {
+    const rows = getDb().prepare(`SELECT * FROM payment_validations WHERE status='pending' ORDER BY paidAt ASC`).all();
+    return rows;
+}
+export function markPaymentValidationConfirmed(invoiceId, joinAt, confirmedAt) {
+    const result = getDb().prepare(`
+    UPDATE payment_validations
+    SET status='confirmed', confirmedAt=@confirmedAt, joinAt=@joinAt
+    WHERE invoiceId=@invoiceId AND status='pending'
+  `).run({ invoiceId, confirmedAt, joinAt });
+    return result.changes > 0;
+}
+export function markPaymentValidationFailed(invoiceId, failedAt) {
+    const result = getDb().prepare(`
+    UPDATE payment_validations
+    SET status='failed', confirmedAt=@failedAt
+    WHERE invoiceId=@invoiceId AND status='pending'
+  `).run({ invoiceId, failedAt });
+    return result.changes > 0;
+}
+export function recordUserChannelJoin(telegramUserId, chatId, joinAt) {
+    getDb().prepare(`
+    INSERT INTO user_channel_joins (telegramUserId, chatId, lastJoinAt)
+    VALUES (@telegramUserId, @chatId, @joinAt)
+    ON CONFLICT(telegramUserId, chatId) DO UPDATE SET lastJoinAt=@joinAt
+  `).run({ telegramUserId, chatId, joinAt });
+}
+export function getLastUserChannelJoin(telegramUserId, chatId) {
+    const row = getDb().prepare(`SELECT lastJoinAt as ts FROM user_channel_joins WHERE telegramUserId=? AND chatId=?`).get(telegramUserId, chatId);
+    return row?.ts ?? null;
+}
+export function getRecentPayments(limit) {
+    const rows = getDb().prepare(`
+    SELECT 
+      p.id,
+      p.invoiceId,
+      p.telegramUserId,
+      p.planCode,
+      p.amount,
+      p.status,
+      p.createdAt,
+      p.paidAt,
+      u.username,
+      u.firstName,
+      u.lastName,
+      v.status as validationStatus,
+      v.confirmedAt as validationConfirmedAt,
+      v.joinAt as validationJoinAt,
+      v.deadlineAt as validationDeadlineAt
+    FROM payments p
+    LEFT JOIN users u ON p.telegramUserId = u.telegramUserId
+    LEFT JOIN payment_validations v ON p.invoiceId = v.invoiceId
+    ORDER BY p.createdAt DESC
+    LIMIT ?
+  `).all(limit);
+    return rows;
+}
 // Получить все активные подписки (для рассылки)
 export function getAllActiveSubscriptions() {
     const nowSec = Math.floor(Date.now() / 1000);
@@ -186,7 +322,7 @@ export function createSubscriptionForDays(telegramUserId, chatId, days) {
     const nowSec = Math.floor(Date.now() / 1000);
     // Деактивируем старые подписки этого пользователя
     dbConn.prepare(`UPDATE subscriptions SET active=0 WHERE telegramUserId=? AND chatId=?`).run(telegramUserId, chatId);
-    const secondsToAdd = days * 24 * 60 * 60;
+    const secondsToAdd = days * ONE_DAY_SEC;
     const startAt = nowSec;
     const endAt = nowSec + secondsToAdd;
     const planCode = 'TEST';
@@ -305,11 +441,12 @@ export function findExpiringSubscriptions(inDays) {
     let targetEnd;
     if (inDays === 1) {
         targetStart = nowSec;
-        targetEnd = nowSec + (24 * 60 * 60);
+        targetEnd = nowSec + ONE_DAY_SEC;
     }
     else {
-        targetStart = nowSec + (inDays * 24 * 60 * 60) - (12 * 60 * 60); // -12 часов
-        targetEnd = nowSec + (inDays * 24 * 60 * 60) + (12 * 60 * 60); // +12 часов
+        const halfDay = ONE_DAY_SEC / 2;
+        targetStart = nowSec + (inDays * ONE_DAY_SEC) - halfDay; // -12 часов
+        targetEnd = nowSec + (inDays * ONE_DAY_SEC) + halfDay; // +12 часов
     }
     const rows = getDb().prepare(`
     SELECT * FROM subscriptions 
@@ -357,7 +494,9 @@ export function getAllUsersForExport() {
       p.totalPaid,
       p.lastPaymentAt,
       p.lastPlanCode as purchasedPlanCode,
-      p.lastAmount as lastPaymentAmount
+      p.lastAmount as lastPaymentAmount,
+      p.lastValidationStatus,
+      p.lastValidationAt
     FROM (
       SELECT DISTINCT telegramUserId FROM users
       UNION
@@ -377,12 +516,14 @@ export function getAllUsersForExport() {
         SUM(amount) as totalPaid,
         MAX(paidAt) as lastPaymentAt,
         (SELECT planCode FROM payments p2 WHERE p2.telegramUserId = payments.telegramUserId AND p2.status = 'success' ORDER BY paidAt DESC LIMIT 1) as lastPlanCode,
-        (SELECT amount FROM payments p3 WHERE p3.telegramUserId = payments.telegramUserId AND p3.status = 'success' ORDER BY paidAt DESC LIMIT 1) as lastAmount
+        (SELECT amount FROM payments p3 WHERE p3.telegramUserId = payments.telegramUserId AND p3.status = 'success' ORDER BY paidAt DESC LIMIT 1) as lastAmount,
+        (SELECT status FROM payment_validations v WHERE v.telegramUserId = payments.telegramUserId ORDER BY paidAt DESC LIMIT 1) as lastValidationStatus,
+        (SELECT confirmedAt FROM payment_validations v2 WHERE v2.telegramUserId = payments.telegramUserId ORDER BY paidAt DESC LIMIT 1) as lastValidationAt
       FROM payments 
       WHERE status = 'success'
       GROUP BY telegramUserId
     ) p ON all_users.telegramUserId = p.telegramUserId
-    ORDER BY s.endAt DESC NULLS LAST, all_users.telegramUserId
+    ORDER BY s.endAt IS NULL, s.endAt DESC, all_users.telegramUserId
   `).all();
     return rows.map(row => ({
         telegramUserId: row.telegramUserId,
@@ -397,6 +538,8 @@ export function getAllUsersForExport() {
         totalPaid: row.totalPaid || 0,
         lastPaymentAt: row.lastPaymentAt,
         lastPaymentAmount: row.lastPaymentAmount,
+        lastPaymentValidationStatus: row.lastValidationStatus ?? null,
+        lastPaymentValidationAt: row.lastValidationAt ?? null,
     }));
 }
 //# sourceMappingURL=db.js.map

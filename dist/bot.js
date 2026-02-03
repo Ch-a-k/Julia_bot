@@ -2,8 +2,10 @@ import { Telegraf, Markup, Context, Telegram } from 'telegraf';
 import { config, isAdmin } from './config.js';
 import { PLAN_DETAILS } from './types.js';
 import { createInvoice, fetchInvoiceStatus } from './monopay.js';
-import { insertPayment, hasActiveSubscription, getLastPendingPayment, markPaymentStatus, createOrExtendSubscription, getSetting, setSetting, getAllActiveSubscriptions, createSubscriptionForDays, getUserSubscription, saveUserInfo, getExtendedActiveSubscriptions, findUsersByQuery, getActiveSubscribersIds, getUserInfo, getAllUsersForExport, tryMarkPaymentSuccess, hasSuccessfulPayment } from './db.js';
-import { runExpiredSubscriptionsCheck, getExpiredSubscriptionsInfo } from './scheduler.js';
+import { insertPayment, hasActiveSubscription, getLastPendingPayment, createOrExtendSubscription, getSetting, setSetting, createSubscriptionForDays, getUserSubscription, saveUserInfo, getExtendedActiveSubscriptions, findUsersByQuery, getActiveSubscribersIds, getUserInfo, getAllUsersForExport, tryMarkPaymentSuccess, hasSuccessfulPayment, hasValidatedPayment, createPaymentValidation, getPendingPaymentValidationForUser, markPaymentValidationConfirmed, recordUserChannelJoin, getRecentPayments } from './db.js';
+import { runExpiredSubscriptionsCheck, getExpiredSubscriptionsInfo, runPaymentsCheck } from './scheduler.js';
+import { PAYMENT_VALIDATION_TIMEOUT_SEC, INVITE_LINK_EXPIRE_SEC, BROADCAST_DELAY_MS } from './constants.js';
+import { getRecentLogs, getRecentErrors, subscribeToLogs, unsubscribeFromLogs, isSubscribed, getLogStats } from './logger.js';
 // Форматирование даты на русском
 function formatDateRu(timestamp) {
     const date = new Date(timestamp * 1000);
@@ -22,38 +24,41 @@ function formatDateTimeRu(timestamp) {
 }
 // Состояние для broadcast (хранится в памяти, сбрасывается при перезапуске)
 const broadcastState = new Map();
+export async function generateInviteLink(telegram, userId) {
+    const nowSec = Math.floor(Date.now() / 1000);
+    try {
+        const invite = await telegram.createChatInviteLink(config.telegramChannelId, {
+            expire_date: nowSec + INVITE_LINK_EXPIRE_SEC,
+            member_limit: 1,
+            creates_join_request: false,
+            name: `access-${userId}-${Date.now()}`,
+        });
+        return invite.invite_link || invite.inviteLink;
+    }
+    catch (err) {
+        console.error('[InviteLink] Ошибка создания персональной ссылки:', err);
+        try {
+            return await telegram.exportChatInviteLink(config.telegramChannelId);
+        }
+        catch (err2) {
+            console.error('[InviteLink] Ошибка экспорта общей ссылки:', err2);
+            return undefined;
+        }
+    }
+}
 export function createBot() {
     const bot = new Telegraf(config.telegramBotToken);
     async function isUserSubscribed(userId) {
         try {
             const member = await bot.telegram.getChatMember(config.telegramChannelId, userId);
-            const status = member.status;
-            return status !== 'left' && status !== 'kicked';
+            return member.status !== 'left' && member.status !== 'kicked';
         }
         catch {
             return false;
         }
     }
     async function generateInviteLinkFor(userId) {
-        const nowSec = Math.floor(Date.now() / 1000);
-        try {
-            const expireIn = 24 * 60 * 60;
-            const invite = await bot.telegram.createChatInviteLink(config.telegramChannelId, {
-                expire_date: nowSec + expireIn,
-                member_limit: 1,
-                creates_join_request: false,
-                name: `access-${userId}-${Date.now()}`,
-            });
-            return invite.invite_link || invite.inviteLink;
-        }
-        catch {
-            try {
-                return await bot.telegram.exportChatInviteLink(config.telegramChannelId);
-            }
-            catch {
-                return undefined;
-            }
-        }
+        return generateInviteLink(bot.telegram, userId);
     }
     const welcomeText = [
         'Телеграм-канал «Психосоматика. Живая правда с Юлией Самошиной»',
@@ -126,7 +131,8 @@ export function createBot() {
     });
     bot.action('menu:subscribe', async (ctx) => {
         const text = 'Выберите тариф подписки:';
-        const isPhoto = ctx.callbackQuery?.message?.photo;
+        const message = ctx.callbackQuery?.message;
+        const isPhoto = Array.isArray(message?.photo) && message.photo.length > 0;
         const opts = { reply_markup: tariffsKeyboard.reply_markup };
         if (isPhoto) {
             await ctx.editMessageCaption(text, opts);
@@ -148,7 +154,8 @@ export function createBot() {
                 [Markup.button.callback('◀︎ Назад в меню', 'menu:info')],
             ].filter(r => r.length > 0));
             const text = link ? 'Админ-доступ: нажмите, чтобы перейти в канал.' : 'Не удалось создать ссылку. Проверьте права бота.';
-            const isPhoto = ctx.callbackQuery?.message?.photo;
+            const message = ctx.callbackQuery?.message;
+            const isPhoto = Array.isArray(message?.photo) && message.photo.length > 0;
             const opts = { reply_markup: kb.reply_markup };
             if (isPhoto)
                 await ctx.editMessageCaption(text, opts);
@@ -158,8 +165,9 @@ export function createBot() {
         }
         // Доступ даём только при активной подписке + наличии успешной оплаты.
         // Это закрывает кейс "в subscriptions есть запись (например, тест/ручная), но в payments нет".
-        const active = hasActiveSubscription(user.id, config.telegramChannelId, nowSec) && hasSuccessfulPayment(user.id);
-        const isPhoto = ctx.callbackQuery?.message?.photo;
+        const active = hasActiveSubscription(user.id, config.telegramChannelId, nowSec) && hasValidatedPayment(user.id);
+        const message = ctx.callbackQuery?.message;
+        const isPhoto = Array.isArray(message?.photo) && message.photo.length > 0;
         if (active) {
             const link = await generateInviteLinkFor(user.id);
             const kb = Markup.inlineKeyboard([
@@ -174,6 +182,43 @@ export function createBot() {
                 await ctx.editMessageText(text, opts);
         }
         else {
+            const pendingValidation = getPendingPaymentValidationForUser(user.id, nowSec);
+            if (pendingValidation) {
+                const isInChannel = await isUserSubscribed(user.id);
+                if (isInChannel) {
+                    const updated = markPaymentValidationConfirmed(pendingValidation.invoiceId, nowSec, nowSec);
+                    if (updated) {
+                        const months = PLAN_DETAILS[pendingValidation.planCode].months;
+                        createOrExtendSubscription(user.id, config.telegramChannelId, pendingValidation.planCode, months, nowSec);
+                    }
+                    const link = await generateInviteLinkFor(user.id);
+                    const kb = Markup.inlineKeyboard([
+                        link ? [Markup.button.url('Перейти в канал', link)] : [],
+                        [Markup.button.callback('◀︎ Назад в меню', 'menu:info')],
+                    ].filter(r => r.length > 0));
+                    const text = link ? 'Оплата подтверждена. Нажмите, чтобы перейти в канал.' : 'Оплата подтверждена, но не удалось создать ссылку. Свяжитесь с поддержкой.';
+                    const opts = { reply_markup: kb.reply_markup };
+                    if (isPhoto)
+                        await ctx.editMessageCaption(text, opts);
+                    else
+                        await ctx.editMessageText(text, opts);
+                    return;
+                }
+                const link = await generateInviteLinkFor(user.id);
+                const kb = Markup.inlineKeyboard([
+                    link ? [Markup.button.url('Перейти в канал', link)] : [],
+                    [Markup.button.callback('◀︎ Назад в меню', 'menu:info')],
+                ].filter(r => r.length > 0));
+                const text = link
+                    ? 'Оплата в обработке. Перейдите по ссылке в течение 10 минут для подтверждения.'
+                    : 'Оплата в обработке. Перейдите в бота и получите ссылку. На подтверждение есть 10 минут.';
+                const opts = { reply_markup: kb.reply_markup };
+                if (isPhoto)
+                    await ctx.editMessageCaption(text, opts);
+                else
+                    await ctx.editMessageText(text, opts);
+                return;
+            }
             const pending = getLastPendingPayment(user.id);
             if (pending) {
                 try {
@@ -182,15 +227,55 @@ export function createBot() {
                         // Атомарная проверка: если платёж уже обработан, пропускаем
                         const updated = tryMarkPaymentSuccess(pending.invoiceId, nowSec);
                         if (updated) {
-                            const months = PLAN_DETAILS[pending.planCode].months;
-                            createOrExtendSubscription(user.id, config.telegramChannelId, pending.planCode, months, nowSec);
+                            const isInChannel = await isUserSubscribed(user.id);
+                            if (isInChannel) {
+                                const months = PLAN_DETAILS[pending.planCode].months;
+                                createOrExtendSubscription(user.id, config.telegramChannelId, pending.planCode, months, nowSec);
+                                createPaymentValidation({
+                                    invoiceId: pending.invoiceId,
+                                    telegramUserId: user.id,
+                                    planCode: pending.planCode,
+                                    paidAt: nowSec,
+                                    deadlineAt: nowSec,
+                                    status: 'confirmed',
+                                    confirmedAt: nowSec,
+                                    joinAt: nowSec,
+                                });
+                            }
+                            else {
+                                createPaymentValidation({
+                                    invoiceId: pending.invoiceId,
+                                    telegramUserId: user.id,
+                                    planCode: pending.planCode,
+                                    paidAt: nowSec,
+                                    deadlineAt: nowSec + PAYMENT_VALIDATION_TIMEOUT_SEC,
+                                    status: 'pending',
+                                    confirmedAt: null,
+                                    joinAt: null,
+                                });
+                            }
+                        }
+                        else {
+                            const isInChannel = await isUserSubscribed(user.id);
+                            createPaymentValidation({
+                                invoiceId: pending.invoiceId,
+                                telegramUserId: user.id,
+                                planCode: pending.planCode,
+                                paidAt: nowSec,
+                                deadlineAt: isInChannel ? nowSec : nowSec + PAYMENT_VALIDATION_TIMEOUT_SEC,
+                                status: isInChannel ? 'confirmed' : 'pending',
+                                confirmedAt: isInChannel ? nowSec : null,
+                                joinAt: isInChannel ? nowSec : null,
+                            });
                         }
                         const link = await generateInviteLinkFor(user.id);
                         const kb = Markup.inlineKeyboard([
                             link ? [Markup.button.url('Перейти в канал', link)] : [],
                             [Markup.button.callback('◀︎ Назад в меню', 'menu:info')],
                         ].filter(r => r.length > 0));
-                        const text = link ? 'Оплата найдена. Нажмите, чтобы перейти в канал.' : 'Оплата найдена, но не удалось создать ссылку. Свяжитесь с поддержкой.';
+                        const text = link
+                            ? 'Оплата найдена. Нажмите, чтобы перейти в канал (на подтверждение есть 10 минут).'
+                            : 'Оплата найдена, но не удалось создать ссылку. Свяжитесь с поддержкой.';
                         const opts = { reply_markup: kb.reply_markup };
                         if (isPhoto)
                             await ctx.editMessageCaption(text, opts);
@@ -199,7 +284,9 @@ export function createBot() {
                         return;
                     }
                 }
-                catch { }
+                catch (err) {
+                    console.error('[CheckAccess] Ошибка проверки статуса pending платежа:', err);
+                }
             }
             const kb = Markup.inlineKeyboard([
                 [Markup.button.callback('Оформить подписку', 'menu:subscribe')],
@@ -250,7 +337,8 @@ export function createBot() {
             const link = await generateInviteLinkFor(ctx.from.id);
             await ctx.reply(link ? `Ссылка: ${link}` : 'Не удалось создать ссылку.');
         }
-        catch {
+        catch (err) {
+            console.error('[InviteLink] Ошибка команды invitelink:', err);
             await ctx.reply('Ошибка создания ссылки.');
         }
     });
@@ -390,7 +478,7 @@ export function createBot() {
                 }
                 await ctx.telegram.sendMessage(userId, personalizedMessage, { parse_mode: 'HTML' });
                 sent++;
-                await new Promise(resolve => setTimeout(resolve, 100));
+                await new Promise(resolve => setTimeout(resolve, BROADCAST_DELAY_MS));
             }
             catch (err) {
                 failed++;
@@ -563,7 +651,54 @@ export function createBot() {
             await ctx.reply(text, { parse_mode: 'HTML' });
             // Небольшая задержка между сообщениями
             if (i + chunkSize < subscriptions.length) {
-                await new Promise(resolve => setTimeout(resolve, 100));
+                await new Promise(resolve => setTimeout(resolve, BROADCAST_DELAY_MS));
+            }
+        }
+    });
+    // Admin-only: list recent payments (analytics)
+    bot.command('payments', async (ctx) => {
+        if (!isAdmin(ctx.from?.id))
+            return;
+        const args = ctx.message.text.split(' ').slice(1);
+        const limit = Math.min(Math.max(parseInt(args[0] || '10', 10) || 10, 1), 50);
+        const payments = getRecentPayments(limit);
+        if (payments.length === 0) {
+            await ctx.reply('📭 Нет платежей.');
+            return;
+        }
+        const formatPay = (p, idx) => {
+            const lines = [];
+            const nameParts = [];
+            if (p.firstName)
+                nameParts.push(p.firstName);
+            if (p.lastName)
+                nameParts.push(p.lastName);
+            const fullName = nameParts.length > 0 ? nameParts.join(' ') : '—';
+            const paidAt = p.paidAt ? formatDateTimeRu(p.paidAt) : '—';
+            const createdAt = formatDateTimeRu(p.createdAt);
+            const validationStatus = p.validationStatus || '—';
+            const validationAt = p.validationConfirmedAt ? formatDateTimeRu(p.validationConfirmedAt) : '—';
+            lines.push(`<b>${idx}.</b>`);
+            lines.push(`👤 ${fullName}`);
+            if (p.username)
+                lines.push(`📱 @${p.username}`);
+            lines.push(`🆔 <code>${p.telegramUserId}</code>`);
+            lines.push(`📦 ${p.planCode}`);
+            lines.push(`💰 ${(p.amount / 100).toFixed(0)}₴`);
+            lines.push(`🧾 Статус: ${p.status}`);
+            lines.push(`🕒 Создан: ${createdAt}`);
+            lines.push(`✅ Оплачен: ${paidAt}`);
+            lines.push(`🔎 Валидация: ${validationStatus} (${validationAt})`);
+            return lines.join('\n');
+        };
+        await ctx.reply(`📈 <b>Последние платежи: ${payments.length}</b>`, { parse_mode: 'HTML' });
+        const chunkSize = 5;
+        for (let i = 0; i < payments.length; i += chunkSize) {
+            const chunk = payments.slice(i, i + chunkSize);
+            const text = chunk.map((p, idx) => formatPay(p, i + idx + 1)).join('\n\n────────────────\n\n');
+            await ctx.reply(text, { parse_mode: 'HTML' });
+            if (i + chunkSize < payments.length) {
+                await new Promise(resolve => setTimeout(resolve, BROADCAST_DELAY_MS));
             }
         }
     });
@@ -607,9 +742,9 @@ export function createBot() {
                     });
                 }
             }
-            catch (e) {
+            catch (err) {
                 // не делаем фатальным — подписка уже создана
-                console.warn('[GrantSub] Не удалось записать "подарочную" оплату:', e);
+                console.warn('[GrantSub] Не удалось записать "подарочную" оплату:', err);
             }
             await ctx.reply(`✅ Подписка создана!\n\n` +
                 `👤 User ID: ${userId}\n` +
@@ -624,7 +759,8 @@ export function createBot() {
                 await ctx.telegram.sendMessage(userId, userMessage);
                 await ctx.reply('📨 Пользователь уведомлён.');
             }
-            catch {
+            catch (err) {
+                console.error('[GrantSub] Ошибка уведомления пользователя:', err);
                 await ctx.reply('⚠️ Не удалось уведомить пользователя (возможно, он не начинал диалог с ботом).');
             }
         }
@@ -661,15 +797,16 @@ export function createBot() {
                 await removeUserFromChannel(ctx.telegram, config.telegramChannelId, userId);
                 await ctx.reply(`✅ Подписка пользователя ${userId} отозвана, доступ к каналу закрыт.`);
             }
-            catch {
+            catch (err) {
+                console.error('[RevokeSub] Ошибка удаления из канала:', err);
                 await ctx.reply(`✅ Подписка отозвана, но не удалось удалить из канала (возможно, уже не в канале).`);
             }
             // Уведомляем пользователя
             try {
                 await ctx.telegram.sendMessage(userId, 'Ваша подписка была отозвана. Доступ к каналу закрыт.');
             }
-            catch {
-                // Пользователь мог заблокировать бота
+            catch (err) {
+                console.error('[RevokeSub] Ошибка уведомления пользователя:', err);
             }
         }
         catch (err) {
@@ -712,7 +849,9 @@ export function createBot() {
                 'Купленный тариф',
                 'Последняя оплата (грн)',
                 'Дата оплаты',
-                'Всего оплачено (грн)'
+                'Всего оплачено (грн)',
+                'Статус валидации',
+                'Дата валидации'
             ].join(';'));
             // Данные
             for (const u of users) {
@@ -727,7 +866,9 @@ export function createBot() {
                     u.purchasedPlanCode ? (planNames[u.purchasedPlanCode] || u.purchasedPlanCode) : '',
                     u.lastPaymentAmount ? (u.lastPaymentAmount / 100).toFixed(0) : '',
                     formatDate(u.lastPaymentAt),
-                    u.totalPaid ? (u.totalPaid / 100).toFixed(0) : '0'
+                    u.totalPaid ? (u.totalPaid / 100).toFixed(0) : '0',
+                    u.lastPaymentValidationStatus || '',
+                    formatDate(u.lastPaymentValidationAt)
                 ].join(';'));
             }
             const csvContent = csvRows.join('\n');
@@ -760,17 +901,142 @@ export function createBot() {
             '/grantsub ID ДНИ — <i>выдать подписку</i>',
             '/revokesub ID — <i>забрать подписку</i>',
             '/export — <i>скачать CSV всех пользователей</i>',
+            '/payments [N] — <i>последние платежи и валидация</i>',
+            '/checkpayments — <i>принудительная проверка оплат</i>',
             '',
             '━━━━ <b>📤 Рассылка</b> ━━━━',
             '',
             '/broadcast — <i>рассылка с предпросмотром</i>',
             '',
+            '━━━━ <b>📊 Логи и мониторинг</b> ━━━━',
+            '',
+            '/logs [N] — <i>последние N логов (по умолчанию 50)</i>',
+            '/errors [N] — <i>последние N ошибок (по умолчанию 20)</i>',
+            '/logstream — <i>подписаться на логи в реальном времени</i>',
+            '/stopstream — <i>отписаться от логов</i>',
+            '/logstats — <i>статистика логов</i>',
+            '',
             '━━━━ <b>⚙️ Прочее</b> ━━━━',
             '',
             '/invitelink — <i>Одноразовая ссылка на канал</i>',
+            '/diag — <i>диагностика бота и подписок</i>',
             '/whoami — <i>узнать ID</i>',
         ].join('\n');
         await ctx.reply(help, { parse_mode: 'HTML' });
+    });
+    // Admin-only: получить последние логи
+    bot.command('logs', async (ctx) => {
+        if (!isAdmin(ctx.from?.id))
+            return;
+        const args = ctx.message.text.split(' ').slice(1);
+        const count = Math.min(Math.max(parseInt(args[0] || '50', 10) || 50, 1), 100);
+        try {
+            const logs = getRecentLogs(count);
+            // Разбиваем на части если слишком длинное
+            const maxLength = 4000;
+            if (logs.length <= maxLength) {
+                await ctx.reply(`📋 <b>Последние ${count} логов:</b>\n\n<code>${logs}</code>`, { parse_mode: 'HTML' });
+            }
+            else {
+                // Отправляем по частям
+                const chunks = logs.match(new RegExp(`.{1,${maxLength}}`, 'g')) || [];
+                await ctx.reply(`📋 <b>Последние ${count} логов (часть 1/${chunks.length}):</b>`, { parse_mode: 'HTML' });
+                for (let i = 0; i < chunks.length; i++) {
+                    await ctx.reply(`<code>${chunks[i]}</code>`, { parse_mode: 'HTML' });
+                    if (i < chunks.length - 1) {
+                        await new Promise(resolve => setTimeout(resolve, 300));
+                    }
+                }
+            }
+        }
+        catch (err) {
+            await ctx.reply(`❌ Ошибка получения логов: ${err}`);
+        }
+    });
+    // Admin-only: получить только ошибки
+    bot.command('errors', async (ctx) => {
+        if (!isAdmin(ctx.from?.id))
+            return;
+        const args = ctx.message.text.split(' ').slice(1);
+        const count = Math.min(Math.max(parseInt(args[0] || '20', 10) || 20, 1), 50);
+        try {
+            const errors = getRecentErrors(count);
+            await ctx.reply(`🔴 <b>Последние ${count} ошибок:</b>\n\n<code>${errors}</code>`, { parse_mode: 'HTML' });
+        }
+        catch (err) {
+            await ctx.reply(`❌ Ошибка получения ошибок: ${err}`);
+        }
+    });
+    // Admin-only: подписаться на логи в реальном времени
+    bot.command('logstream', async (ctx) => {
+        if (!isAdmin(ctx.from?.id))
+            return;
+        const userId = ctx.from.id;
+        if (isSubscribed(userId)) {
+            await ctx.reply('ℹ️ Вы уже подписаны на логи в реальном времени.\n\nДля отписки используйте /stopstream');
+            return;
+        }
+        subscribeToLogs(userId);
+        await ctx.reply('✅ <b>Подписка на логи активирована!</b>\n\n' +
+            'Теперь <b>только вы</b> будете получать все логи бота в реальном времени:\n' +
+            '📝 INFO — обычные сообщения\n' +
+            '⚠️ WARN — предупреждения\n' +
+            '🔴 ERROR — ошибки\n\n' +
+            '💡 <i>Каждый админ может подписаться независимо</i>\n\n' +
+            'Для отключения используйте /stopstream', { parse_mode: 'HTML' });
+    });
+    // Admin-only: отписаться от логов
+    bot.command('stopstream', async (ctx) => {
+        if (!isAdmin(ctx.from?.id))
+            return;
+        const userId = ctx.from.id;
+        if (!isSubscribed(userId)) {
+            await ctx.reply('ℹ️ Вы не подписаны на логи.');
+            return;
+        }
+        unsubscribeFromLogs(userId);
+        await ctx.reply('✅ Подписка на логи отключена.');
+    });
+    // Admin-only: статистика логов
+    bot.command('logstats', async (ctx) => {
+        if (!isAdmin(ctx.from?.id))
+            return;
+        const stats = getLogStats();
+        const text = [
+            '📊 <b>Статистика логов</b>',
+            '',
+            `📝 Всего записей в буфере: <b>${stats.total}</b>`,
+            `🔴 Ошибок: <b>${stats.errors}</b>`,
+            `⚠️ Предупреждений: <b>${stats.warnings}</b>`,
+            `👥 Подписчиков на stream: <b>${stats.subscribers}</b>`,
+            '',
+            '<i>Буфер хранит последние 500 записей</i>',
+        ].join('\n');
+        await ctx.reply(text, { parse_mode: 'HTML' });
+    });
+    // Admin-only: force payments check (button)
+    bot.command('checkpayments', async (ctx) => {
+        if (!isAdmin(ctx.from?.id))
+            return;
+        const kb = Markup.inlineKeyboard([
+            [Markup.button.callback('🔄 Проверить оплаты сейчас', 'admin:checkpayments')],
+        ]);
+        await ctx.reply('Нажмите кнопку для принудительной проверки оплат и валидации:', { reply_markup: kb.reply_markup });
+    });
+    bot.action('admin:checkpayments', async (ctx) => {
+        if (!isAdmin(ctx.from?.id))
+            return;
+        await ctx.editMessageText('⏳ Проверяю оплаты и валидацию...');
+        const result = await runPaymentsCheck(ctx.telegram);
+        const text = [
+            '✅ Проверка завершена',
+            `Успешных оплат: ${result.success}`,
+            `Ошибочных/истёкших: ${result.failed}`,
+            `Ожидают подтверждения: ${result.pendingConfirm}`,
+            `Подтверждено: ${result.confirmed}`,
+            `Не подтверждено: ${result.validationFailed}`,
+        ].join('\n');
+        await ctx.reply(text);
     });
     // Admin-only: diagnostics (bot permissions + subscriptions counters)
     bot.command('diag', async (ctx) => {
@@ -836,9 +1102,8 @@ export function createBot() {
             const months = PLAN_DETAILS[plan].months;
             // generate invite link immediately without payment
             try {
-                const expireIn = 24 * 60 * 60;
                 const invite = await ctx.telegram.createChatInviteLink(config.telegramChannelId, {
-                    expire_date: nowSec + expireIn,
+                    expire_date: nowSec + INVITE_LINK_EXPIRE_SEC,
                     member_limit: 1,
                     creates_join_request: false,
                     name: `test-${user.id}-${plan}-${Date.now()}`,
@@ -846,12 +1111,14 @@ export function createBot() {
                 const inviteLink = invite.invite_link || invite.inviteLink;
                 await ctx.reply(`ТЕСТОВЫЙ РЕЖИМ: доступ на ${months} мес. Ваша ссылка: ${inviteLink}`);
             }
-            catch {
+            catch (err) {
+                console.error('[TestMode] Ошибка создания персональной ссылки:', err);
                 try {
                     const fallbackLink = await ctx.telegram.exportChatInviteLink(config.telegramChannelId);
                     await ctx.reply(`ТЕСТОВЫЙ РЕЖИМ: доступ на ${months} мес. Ссылка: ${fallbackLink}`);
                 }
-                catch {
+                catch (err2) {
+                    console.error('[TestMode] Ошибка экспорта общей ссылки:', err2);
                     await ctx.reply('ТЕСТОВЫЙ РЕЖИМ: не удалось создать ссылку приглашения. Убедитесь, что бот — администратор канала с правом пригласить по ссылке, и что указан корректный TELEGRAM_CHANNEL_ID (например, -100... или @username).');
                 }
             }
@@ -877,7 +1144,8 @@ export function createBot() {
                 [Markup.button.url('Перейти к оплате', invoice.pageUrl)],
                 [Markup.button.callback('◀︎ Назад в меню', 'menu:info')],
             ]);
-            const isPhoto = ctx.callbackQuery?.message?.photo;
+            const message = ctx.callbackQuery?.message;
+            const isPhoto = Array.isArray(message?.photo) && message.photo.length > 0;
             const text = `${planTitle}. Нажмите, чтобы перейти к оплате.`;
             const opts = { reply_markup: payBtn.reply_markup };
             if (isPhoto)
@@ -885,7 +1153,8 @@ export function createBot() {
             else
                 await ctx.editMessageText(text, opts);
         }
-        catch (e) {
+        catch (err) {
+            console.error('[Buy] Ошибка создания счёта MonoPay:', err);
             await ctx.reply('Не удалось создать счёт. Попробуйте позже.');
         }
     });
@@ -897,6 +1166,8 @@ export function createBot() {
             if (!update)
                 return;
             const chatId = update.chat.id.toString();
+            if (chatId !== config.telegramChannelId)
+                return;
             const userId = update.new_chat_member.user.id;
             const newStatus = update.new_chat_member.status;
             const oldStatus = update.old_chat_member.status;
@@ -909,9 +1180,18 @@ export function createBot() {
             if (isAdmin(userId))
                 return;
             console.log(`[ChatMember] Пользователь ${userId} вступил в канал ${chatId}`);
-            // Проверяем подписку
             const nowSec = Math.floor(Date.now() / 1000);
-            const hasAccess = hasActiveSubscription(userId, chatId, nowSec) && hasSuccessfulPayment(userId);
+            recordUserChannelJoin(userId, chatId, nowSec);
+            const pendingValidation = getPendingPaymentValidationForUser(userId, nowSec);
+            if (pendingValidation) {
+                const updated = markPaymentValidationConfirmed(pendingValidation.invoiceId, nowSec, nowSec);
+                if (updated) {
+                    const months = PLAN_DETAILS[pendingValidation.planCode].months;
+                    createOrExtendSubscription(userId, chatId, pendingValidation.planCode, months, nowSec);
+                }
+            }
+            // Проверяем подписку
+            const hasAccess = hasActiveSubscription(userId, chatId, nowSec) && hasValidatedPayment(userId);
             if (!hasAccess) {
                 console.log(`[ChatMember] У пользователя ${userId} нет активной подписки — удаляем`);
                 // Удаляем из канала

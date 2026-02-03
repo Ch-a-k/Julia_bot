@@ -66,6 +66,11 @@ export function assertConfig(): void {
   if (missing.length) {
     throw new Error(`Missing required env variables: ${missing.join(', ')}`);
   }
+  
+  // Предупреждение о пустом списке админов
+  if (config.adminUserIds.length === 0) {
+    console.warn('[Config] ⚠️  ВНИМАНИЕ: Не указаны ID администраторов (ADMIN_USER_IDS). Админ-команды будут недоступны.');
+  }
 }
 
 

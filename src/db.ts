@@ -3,6 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import { config } from './config.js';
 import type { PlanCode } from './types.js';
+import { ONE_MONTH_APPROX_SEC, ONE_DAY_SEC } from './constants.js';
 
 export type Subscription = {
   id: number;
@@ -239,7 +240,7 @@ export function createOrExtendSubscription(
     )
     .get(telegramUserId, chatId) as Subscription | undefined;
 
-  const secondsToAdd = Math.floor(months * 30 * 24 * 60 * 60); // approx
+  const secondsToAdd = Math.floor(months * ONE_MONTH_APPROX_SEC);
   let startAt = nowSec;
   let endAt = nowSec + secondsToAdd;
 
@@ -463,7 +464,7 @@ export function createSubscriptionForDays(
     `UPDATE subscriptions SET active=0 WHERE telegramUserId=? AND chatId=?`
   ).run(telegramUserId, chatId);
   
-  const secondsToAdd = days * 24 * 60 * 60;
+  const secondsToAdd = days * ONE_DAY_SEC;
   const startAt = nowSec;
   const endAt = nowSec + secondsToAdd;
   const planCode = 'TEST' as PlanCode;
@@ -630,10 +631,11 @@ export function findExpiringSubscriptions(inDays: number): Subscription[] {
   let targetEnd: number;
   if (inDays === 1) {
     targetStart = nowSec;
-    targetEnd = nowSec + (24 * 60 * 60);
+    targetEnd = nowSec + ONE_DAY_SEC;
   } else {
-    targetStart = nowSec + (inDays * 24 * 60 * 60) - (12 * 60 * 60); // -12 часов
-    targetEnd = nowSec + (inDays * 24 * 60 * 60) + (12 * 60 * 60);   // +12 часов
+    const halfDay = ONE_DAY_SEC / 2;
+    targetStart = nowSec + (inDays * ONE_DAY_SEC) - halfDay; // -12 часов
+    targetEnd = nowSec + (inDays * ONE_DAY_SEC) + halfDay;   // +12 часов
   }
   
   const rows = getDb().prepare(`
@@ -734,7 +736,7 @@ export function getAllUsersForExport(): UserExportData[] {
       WHERE status = 'success'
       GROUP BY telegramUserId
     ) p ON all_users.telegramUserId = p.telegramUserId
-    ORDER BY s.endAt DESC NULLS LAST, all_users.telegramUserId
+    ORDER BY s.endAt IS NULL, s.endAt DESC, all_users.telegramUserId
   `).all() as Array<{
     telegramUserId: number;
     username: string | null;

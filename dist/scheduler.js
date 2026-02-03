@@ -1,19 +1,16 @@
 import cron from 'node-cron';
-import { findExpiredActiveSubscriptions, deactivateSubscription, listKnownUserIds, hasActiveSubscription, getLastReminderAt, setReminderSentNow, getDb, createOrExtendSubscription, findExpiringSubscriptions, wasExpiryReminderSent, markExpiryReminderSent, initExpiryRemindersTable, tryMarkPaymentSuccess, listUserIdsWithoutSuccessfulPayment } from './db.js';
+import { findExpiredActiveSubscriptions, deactivateSubscription, listKnownUserIds, hasActiveSubscription, getReminderInfo, setReminderSentNow, getDb, createOrExtendSubscription, findExpiringSubscriptions, wasExpiryReminderSent, markExpiryReminderSent, initExpiryRemindersTable, tryMarkPaymentSuccess, listUserIdsWithoutValidatedPayment, createPaymentValidation, listPendingPaymentValidations, markPaymentValidationConfirmed, markPaymentValidationFailed, getLastUserChannelJoin } from './db.js';
 import { config, isAdmin } from './config.js';
 import { Telegram, Markup } from 'telegraf';
-import { removeUserFromChannel } from './bot.js';
+import { removeUserFromChannel, generateInviteLink } from './bot.js';
 import { PLAN_DETAILS } from './types.js';
 import { fetchInvoiceStatus } from './monopay.js';
+import { CRON_TIMEZONE, EXPIRY_NOTICE_KEY, PAYMENT_VALIDATION_TIMEOUT_SEC, INVITE_LINK_EXPIRE_SEC, ONE_DAY_SEC, BROADCAST_DELAY_MS, SCHEDULER_ANTIFLOOD_DELAY_MS } from './constants.js';
 // Клавиатура тарифов для сообщений об истечении
 const tariffsKeyboard = Markup.inlineKeyboard([
     [Markup.button.callback('Подписка 1 месяц — 700₴', 'buy:P1M')],
     [Markup.button.callback('Подписка 2 месяца — 1200₴', 'buy:P2M')],
 ]);
-// Часовой пояс для cron (Киев)
-const CRON_TIMEZONE = 'Europe/Kiev';
-// daysBeforeExpiry=0 используем как "уведомление об истечении уже отправляли"
-const EXPIRY_NOTICE_KEY = 0;
 // Форматирование даты
 function formatDateRu(timestamp) {
     const date = new Date(timestamp * 1000);
@@ -23,6 +20,61 @@ function formatDateRu(timestamp) {
 }
 let expiredJobInProgress = false;
 let unpaidAuditInProgress = false;
+let paymentsCheckInProgress = false;
+let validationsCheckInProgress = false;
+async function isUserInChannel(telegram, chatId, userId) {
+    try {
+        const member = await telegram.getChatMember(chatId, userId);
+        const status = member?.status;
+        return (status === 'member' ||
+            status === 'restricted' ||
+            status === 'administrator' ||
+            status === 'creator');
+    }
+    catch {
+        return false;
+    }
+}
+async function handleSuccessfulPayment(telegram, invoiceId, telegramUserId, planCode, paidAt) {
+    const inChannel = await isUserInChannel(telegram, config.telegramChannelId, telegramUserId);
+    const months = PLAN_DETAILS[planCode].months;
+    if (inChannel) {
+        createOrExtendSubscription(telegramUserId, config.telegramChannelId, planCode, months, paidAt);
+        createPaymentValidation({
+            invoiceId,
+            telegramUserId,
+            planCode,
+            paidAt,
+            deadlineAt: paidAt,
+            status: 'confirmed',
+            confirmedAt: paidAt,
+            joinAt: paidAt,
+        });
+        return 'confirmed';
+    }
+    const deadlineAt = paidAt + PAYMENT_VALIDATION_TIMEOUT_SEC;
+    createPaymentValidation({
+        invoiceId,
+        telegramUserId,
+        planCode,
+        paidAt,
+        deadlineAt,
+        status: 'pending',
+        confirmedAt: null,
+        joinAt: null,
+    });
+    try {
+        const link = await generateInviteLink(telegram, telegramUserId);
+        const text = link
+            ? `✅ Оплата получена. В течение 10 минут перейдите по ссылке, чтобы подтвердить оплату:\n\n${link}`
+            : '✅ Оплата получена. Перейдите в бота и получите ссылку на канал. На подтверждение есть 10 минут.';
+        await telegram.sendMessage(telegramUserId, text);
+    }
+    catch (err) {
+        console.error('[Scheduler] Ошибка отправки уведомления об оплате:', err);
+    }
+    return 'pending';
+}
 async function processExpiredSubscriptions(telegram, reason) {
     if (expiredJobInProgress) {
         console.log(`[Scheduler] Пропуск обработки истёкших подписок (уже выполняется): reason=${reason}`);
@@ -38,13 +90,13 @@ async function processExpiredSubscriptions(telegram, reason) {
             console.log(`[Scheduler] Обработка userId=${sub.telegramUserId}, chatId=${sub.chatId}, endAt=${sub.endAt}, now=${nowSec}`);
             let removed = false;
             try {
-                // Используем chatId из подписки, а не из конфига
-                await removeUserFromChannel(telegram, sub.chatId, sub.telegramUserId);
-                console.log(`[Scheduler] Удалён из канала ${sub.chatId}: ${sub.telegramUserId}`);
+                // Всегда используем актуальный chatId из конфига
+                await removeUserFromChannel(telegram, config.telegramChannelId, sub.telegramUserId);
+                console.log(`[Scheduler] Удалён из канала ${config.telegramChannelId}: ${sub.telegramUserId}`);
                 removed = true;
             }
             catch (err) {
-                console.error(`[Scheduler] Ошибка удаления из канала userId=${sub.telegramUserId} chatId=${sub.chatId}:`, err);
+                console.error(`[Scheduler] Ошибка удаления из канала userId=${sub.telegramUserId} chatId=${config.telegramChannelId}:`, err);
             }
             // Важно: если не удалось удалить (например, нет прав), НЕ деактивируем,
             // чтобы бот продолжал пытаться на следующих запусках и было видно ошибку в логах.
@@ -62,7 +114,7 @@ async function processExpiredSubscriptions(telegram, reason) {
                 const message = [
                     '😔 Подписка завершена',
                     '',
-                    'Срок вашей подписки на канал «Психосоматика. Живая правда» истёк.',
+                    'Срок вашей подписки на канал «Психосоматика. Живая правда с Юлией Самошиной» истёк.',
                     '',
                     'Доступ к каналу закрыт, но вы всегда можете вернуться!',
                     '',
@@ -75,10 +127,10 @@ async function processExpiredSubscriptions(telegram, reason) {
                     reply_markup: tariffsKeyboard.reply_markup,
                 });
                 markExpiryReminderSent(sub.id, EXPIRY_NOTICE_KEY);
-                console.log(`[Scheduler] Уведомление отправлено: ${sub.telegramUserId}`);
+                console.log(`[Scheduler] Уведомление об истечении отправлено: ${sub.telegramUserId}`);
             }
             catch (err) {
-                console.error(`[Scheduler] Ошибка отправки уведомления userId=${sub.telegramUserId}:`, err);
+                console.error(`[Scheduler] Ошибка отправки уведомления об истечении userId=${sub.telegramUserId}:`, err);
             }
         }
         console.log(`[Scheduler] Проверка истёкших подписок завершена. (${reason})`);
@@ -88,6 +140,86 @@ async function processExpiredSubscriptions(telegram, reason) {
     }
     finally {
         expiredJobInProgress = false;
+    }
+}
+async function processPendingPayments(telegram, reason) {
+    if (paymentsCheckInProgress)
+        return { success: 0, failed: 0, pendingConfirm: 0 };
+    paymentsCheckInProgress = true;
+    try {
+        const db = getDb();
+        const pending = db.prepare(`SELECT invoiceId, telegramUserId, planCode FROM payments WHERE status IN ('created','processing','holded')`).all();
+        let success = 0;
+        let failed = 0;
+        let pendingConfirm = 0;
+        for (const p of pending) {
+            try {
+                const status = await fetchInvoiceStatus(p.invoiceId);
+                if (status.status === 'success') {
+                    const nowSec = Math.floor(Date.now() / 1000);
+                    const updated = tryMarkPaymentSuccess(p.invoiceId, nowSec);
+                    if (updated) {
+                        const result = await handleSuccessfulPayment(telegram, p.invoiceId, p.telegramUserId, p.planCode, nowSec);
+                        if (result === 'pending')
+                            pendingConfirm++;
+                        success++;
+                    }
+                }
+                else if (status.status === 'failure' || status.status === 'expired' || status.status === 'reversed') {
+                    db.prepare(`UPDATE payments SET status=? WHERE invoiceId=?`).run(status.status, p.invoiceId);
+                    failed++;
+                }
+            }
+            catch {
+                // ignore transient errors
+            }
+        }
+        return { success, failed, pendingConfirm };
+    }
+    finally {
+        paymentsCheckInProgress = false;
+    }
+}
+async function processPaymentValidations(telegram, reason) {
+    if (validationsCheckInProgress)
+        return { confirmed: 0, failed: 0 };
+    validationsCheckInProgress = true;
+    try {
+        const pending = listPendingPaymentValidations();
+        if (pending.length === 0)
+            return { confirmed: 0, failed: 0 };
+        const nowSec = Math.floor(Date.now() / 1000);
+        let confirmed = 0;
+        let failed = 0;
+        for (const v of pending) {
+            const lastJoin = getLastUserChannelJoin(v.telegramUserId, config.telegramChannelId);
+            if (lastJoin && lastJoin >= v.paidAt && lastJoin <= v.deadlineAt) {
+                const updated = markPaymentValidationConfirmed(v.invoiceId, lastJoin, nowSec);
+                if (updated) {
+                    const months = PLAN_DETAILS[v.planCode].months;
+                    createOrExtendSubscription(v.telegramUserId, config.telegramChannelId, v.planCode, months, nowSec);
+                    confirmed++;
+                }
+                continue;
+            }
+            if (nowSec > v.deadlineAt) {
+                const updated = markPaymentValidationFailed(v.invoiceId, nowSec);
+                if (updated) {
+                    failed++;
+                    try {
+                        await telegram.sendMessage(v.telegramUserId, '⚠️ Оплата не подтверждена (переход в канал не зафиксирован в течение 10 минут). Если вы оплатили, свяжитесь с поддержкой.');
+                    }
+                    catch {
+                        // ignore
+                    }
+                }
+            }
+        }
+        console.log(`[Scheduler] Валидация оплат (${reason}): confirmed=${confirmed}, failed=${failed}`);
+        return { confirmed, failed };
+    }
+    finally {
+        validationsCheckInProgress = false;
     }
 }
 export function startScheduler(telegram) {
@@ -117,7 +249,7 @@ export function startScheduler(telegram) {
                     await telegram.sendMessage(sub.telegramUserId, message, { parse_mode: 'HTML' });
                     markExpiryReminderSent(sub.id, 3);
                     sent++;
-                    await new Promise(resolve => setTimeout(resolve, 100));
+                    await new Promise(resolve => setTimeout(resolve, BROADCAST_DELAY_MS));
                 }
                 catch (err) {
                     console.error(`[Scheduler] Ошибка напоминания за 3 дня userId=${sub.telegramUserId}:`, err);
@@ -151,7 +283,7 @@ export function startScheduler(telegram) {
                     await telegram.sendMessage(sub.telegramUserId, message, { parse_mode: 'HTML' });
                     markExpiryReminderSent(sub.id, 1);
                     sent++;
-                    await new Promise(resolve => setTimeout(resolve, 100));
+                    await new Promise(resolve => setTimeout(resolve, BROADCAST_DELAY_MS));
                 }
                 catch (err) {
                     console.error(`[Scheduler] Ошибка напоминания за 1 день userId=${sub.telegramUserId}:`, err);
@@ -182,7 +314,7 @@ export function startScheduler(telegram) {
             return;
         unpaidAuditInProgress = true;
         try {
-            const unpaid = listUserIdsWithoutSuccessfulPayment();
+            const unpaid = listUserIdsWithoutValidatedPayment();
             if (unpaid.length === 0)
                 return;
             console.log(`[Scheduler] Аудит неоплативших (${reason}): кандидатов=${unpaid.length}`);
@@ -214,7 +346,7 @@ export function startScheduler(telegram) {
                     // getChatMember может падать если бот не видит пользователя (или пользователь не в чате) — игнорируем
                 }
                 // антифлуд
-                await new Promise(resolve => setTimeout(resolve, 120));
+                await new Promise(resolve => setTimeout(resolve, SCHEDULER_ANTIFLOOD_DELAY_MS));
             }
             console.log(`[Scheduler] Аудит неоплативших завершён (${reason}): checked=${checked}, kicked=${kicked}`);
         }
@@ -238,8 +370,10 @@ export function startScheduler(telegram) {
             const active = hasActiveSubscription(uid, config.telegramChannelId, nowSec);
             if (active)
                 continue;
-            const last = getLastReminderAt(uid);
-            if (last && nowSec - last < 24 * 60 * 60)
+            const info = getReminderInfo(uid);
+            if (info.sendCount >= 3)
+                continue;
+            if (info.lastSentAt && nowSec - info.lastSentAt < ONE_DAY_SEC)
                 continue; // remind at most once per day
             try {
                 await telegram.sendMessage(uid, 'Ваша подписка отсутствует или истекла. Чтобы продолжить доступ к каналу, оформите подписку в боте.');
@@ -254,33 +388,27 @@ export function startScheduler(telegram) {
     }, { timezone: CRON_TIMEZONE });
     // Poll pending payments every 2 minutes (no timezone needed, runs globally)
     cron.schedule('*/2 * * * *', async () => {
-        const db = getDb();
-        const pending = db.prepare(`SELECT invoiceId, telegramUserId, planCode FROM payments WHERE status IN ('created','processing','holded')`).all();
-        for (const p of pending) {
-            try {
-                const status = await fetchInvoiceStatus(p.invoiceId);
-                if (status.status === 'success') {
-                    const nowSec = Math.floor(Date.now() / 1000);
-                    // Атомарная проверка: если платёж уже обработан другим процессом, пропускаем
-                    const updated = tryMarkPaymentSuccess(p.invoiceId, nowSec);
-                    if (updated) {
-                        const months = PLAN_DETAILS[p.planCode].months;
-                        createOrExtendSubscription(p.telegramUserId, config.telegramChannelId, p.planCode, months, nowSec);
-                        try {
-                            await telegram.sendMessage(p.telegramUserId, 'Оплата получена! Перейдите в бота и получите ссылку на канал, если не получили.');
-                        }
-                        catch { }
-                    }
-                }
-                else if (status.status === 'failure' || status.status === 'expired' || status.status === 'reversed') {
-                    db.prepare(`UPDATE payments SET status=? WHERE invoiceId=?`).run(status.status, p.invoiceId);
-                }
-            }
-            catch {
-                // ignore transient errors
-            }
-        }
+        await processPendingPayments(telegram, 'cron:payments');
     });
+    // Validate pending payments every 2 minutes
+    cron.schedule('*/2 * * * *', async () => {
+        await processPaymentValidations(telegram, 'cron:validations');
+    });
+    setTimeout(() => {
+        void processPendingPayments(telegram, 'startup');
+        void processPaymentValidations(telegram, 'startup');
+    }, 10_000);
+}
+export async function runPaymentsCheck(telegram) {
+    const payments = await processPendingPayments(telegram, 'manual');
+    const validations = await processPaymentValidations(telegram, 'manual');
+    return {
+        success: payments.success,
+        failed: payments.failed,
+        pendingConfirm: payments.pendingConfirm,
+        confirmed: validations.confirmed,
+        validationFailed: validations.failed,
+    };
 }
 // Функция для ручного запуска проверки истёкших подписок (для отладки/админ-команды)
 export async function runExpiredSubscriptionsCheck(telegram) {
@@ -294,9 +422,8 @@ export async function runExpiredSubscriptionsCheck(telegram) {
         console.log(`[Scheduler] Обработка userId=${sub.telegramUserId}, chatId=${sub.chatId}, endAt=${sub.endAt} (${new Date(sub.endAt * 1000).toISOString()}), now=${nowSec}`);
         let removed = false;
         try {
-            // Используем chatId из подписки, а не из конфига
-            await removeUserFromChannel(telegram, sub.chatId, sub.telegramUserId);
-            console.log(`[Scheduler] Удалён из канала ${sub.chatId}: ${sub.telegramUserId}`);
+            await removeUserFromChannel(telegram, config.telegramChannelId, sub.telegramUserId);
+            console.log(`[Scheduler] Удалён из канала ${config.telegramChannelId}: ${sub.telegramUserId}`);
             removed = true;
         }
         catch (err) {

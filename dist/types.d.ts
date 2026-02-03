@@ -15,4 +15,38 @@ export interface MonoPayWebhookPayload {
     createdDate?: number;
     modifiedDate?: number;
 }
+export type ChatMemberStatus = 'creator' | 'administrator' | 'member' | 'restricted' | 'left' | 'kicked';
+export interface TelegramChatMember {
+    user: {
+        id: number;
+        is_bot: boolean;
+        first_name: string;
+        username?: string;
+    };
+    status: ChatMemberStatus;
+    can_restrict_members?: boolean;
+    can_invite_users?: boolean;
+    canRestrictMembers?: boolean;
+    canInviteUsers?: boolean;
+}
+export interface TelegramChatInviteLink {
+    invite_link?: string;
+    inviteLink?: string;
+    expire_date?: number;
+    member_limit?: number;
+    creates_join_request?: boolean;
+    name?: string;
+}
+export interface TelegramPhotoSize {
+    file_id: string;
+    file_unique_id: string;
+    width: number;
+    height: number;
+    file_size?: number;
+}
+export interface TelegramMessage {
+    photo?: TelegramPhotoSize[];
+    caption?: string;
+    text?: string;
+}
 //# sourceMappingURL=types.d.ts.map
