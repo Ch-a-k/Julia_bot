@@ -170,22 +170,25 @@ export function hasSuccessfulPayment(telegramUserId: number): boolean {
 
 export function hasValidatedPayment(telegramUserId: number): boolean {
   const dbConn = getDb();
+  
+  // 1. Проверяем наличие confirmed валидации
   const confirmed = dbConn.prepare(
     `SELECT 1 FROM payment_validations WHERE telegramUserId=? AND status='confirmed' LIMIT 1`
   ).get(telegramUserId) as { 1: number } | undefined;
   if (confirmed) return true;
 
+  // 2. Проверяем наличие активной pending валидации
   const nowSec = Math.floor(Date.now() / 1000);
   const pending = dbConn.prepare(
     `SELECT deadlineAt FROM payment_validations WHERE telegramUserId=? AND status='pending' ORDER BY paidAt DESC LIMIT 1`
   ).get(telegramUserId) as { deadlineAt: number } | undefined;
   if (pending && pending.deadlineAt >= nowSec) return true;
 
-  const hasAnyValidation = dbConn.prepare(
-    `SELECT 1 FROM payment_validations WHERE telegramUserId=? LIMIT 1`
-  ).get(telegramUserId) as { 1: number } | undefined;
-
-  if (hasAnyValidation) return false;
+  // 3. Если нет active/confirmed валидаций, но есть успешная оплата - разрешаем доступ
+  // Это позволяет работать:
+  // - ручным подпискам через /grantsub (с фиктивной оплатой)
+  // - старым оплатам до введения системы валидации
+  // - случаям, когда валидация истекла, но есть подтвержденная оплата
   return hasSuccessfulPayment(telegramUserId);
 }
 
