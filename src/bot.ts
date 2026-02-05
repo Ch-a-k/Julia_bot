@@ -1289,12 +1289,46 @@ export function createBot(): Telegraf<BotContext> {
 
       const nowSec = Math.floor(Date.now() / 1000);
       recordUserChannelJoin(userId, chatId, nowSec);
+      
+      // Сначала проверяем pending payment validation
       const pendingValidation = getPendingPaymentValidationForUser(userId, nowSec);
       if (pendingValidation) {
         const updated = markPaymentValidationConfirmed(pendingValidation.invoiceId, nowSec, nowSec);
         if (updated) {
           const months = PLAN_DETAILS[pendingValidation.planCode].months;
           createOrExtendSubscription(userId, chatId, pendingValidation.planCode, months, nowSec);
+        }
+        // Доступ разрешён — есть подтверждённая оплата
+        console.log(`[ChatMember] Пользователь ${userId} — оплата подтверждена через validation`);
+        return;
+      }
+
+      // Если нет pending validation, проверяем есть ли pending payment который ещё не обработан
+      const pendingPayment = getLastPendingPayment(userId);
+      if (pendingPayment) {
+        try {
+          const status = await fetchInvoiceStatus(pendingPayment.invoiceId);
+          if (status.status === 'success') {
+            const updated = tryMarkPaymentSuccess(pendingPayment.invoiceId, nowSec);
+            if (updated) {
+              const months = PLAN_DETAILS[pendingPayment.planCode].months;
+              createOrExtendSubscription(userId, chatId, pendingPayment.planCode, months, nowSec);
+              createPaymentValidation({
+                invoiceId: pendingPayment.invoiceId,
+                telegramUserId: userId,
+                planCode: pendingPayment.planCode,
+                paidAt: nowSec,
+                deadlineAt: nowSec,
+                status: 'confirmed',
+                confirmedAt: nowSec,
+                joinAt: nowSec,
+              });
+              console.log(`[ChatMember] Пользователь ${userId} — оплата подтверждена через pending payment`);
+              return;
+            }
+          }
+        } catch (err) {
+          console.error(`[ChatMember] Ошибка проверки pending payment userId=${userId}:`, err);
         }
       }
 
